@@ -20,9 +20,9 @@ BotExchange 包装底层 session 并转发统一接口。不要绕过策略订�
 
 ## 能力与错误处理
 
-`ResolveRuntimePriceSymbol(exchange, pair)` 返回 `([4]string, *errs.Error)` (base/quote/settle/identifier)；特殊符号由适配器解析，通用符号可回退分隔符解析。`BuildClientOrderIDChecked` 为严格版本；旧 BuildClientOrderID 失败时回退旧格式，不能用于证明严格校验通过。
+`ResolveRuntimePriceSymbol(exchange, pair)` 返回 `([4]string, *errs.Error)` (base/quote/settle/identifier)；特殊符号由适配器解析，通用符号可回退分隔符解析。`BuildClientOrderID` 优先使用适配器能力，失败时回退旧格式，不能用于证明严格校验通过。
 
-`SetOrderCallback(exchange, func(*PutOrderRes) *errs.Error) bool` 安装实例级回调，返回是否支持。BotExchange 对下单成功和失败均调用回调；回调错误可覆盖原错误，即使返回 error 仍可能有非 nil Order，需同时检查。显式设置 nil 会禁用旧全局 AfterCreateOrder 回退。
+下单回调（`SetOrderCallback`、全局 `AfterCreateOrder`）已随旧实盘栈删除，`BotExchange` 不再拦截 `CreateOrder`；`PutOrderRes` 类型仅为旧 dump 的解码保留。
 
 `GetAlignOffForMarket(market *banexg.Market, tfSecs int) int` 是纯函数版本，直接按品种元数据计算偏移（秒）。`GetAlignOffForExchangeChecked` 的 offset 单位为秒，基于品种交易时段，仅日线及以上需要非零偏移。无能力的账户导出（`StartAccountDownload`/`GetAccountDownload`）或归档 URL（`BuildArchiveURL`）返回不支持错误，目前没有适配器实现这些能力；存在封装函数并不代表当前交易所实现了它。精度函数只做舍入/合约数量单位处理，不保证余额、最小下单额或成交。
 

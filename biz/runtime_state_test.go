@@ -19,12 +19,9 @@ func TestTradingStateRegistryAccessIsSafeDuringReset(t *testing.T) {
 			for i := 0; i < 500; i++ {
 				account := "account-" + strconv.Itoa(i%4)
 				state.SetOrderManager(account, nil)
-				state.SetLiveManager(account, nil)
 				_ = state.OrderManager(account)
-				_ = state.LiveManager(account)
 				_ = state.Wallet(account)
 				_ = state.OrderManagersSnapshot()
-				_ = state.LiveManagersSnapshot()
 				_ = state.WalletsSnapshot()
 			}
 		}()
@@ -41,9 +38,9 @@ func TestTradingStateRegistryAccessIsSafeDuringReset(t *testing.T) {
 	close(start)
 	wg.Wait()
 	state.Reset()
-	if len(state.OrderManagersSnapshot()) != 0 || len(state.LiveManagersSnapshot()) != 0 || len(state.WalletsSnapshot()) != 0 {
-		t.Fatalf("trading state was not reset: managers=%d live=%d wallets=%d",
-			len(state.OrderManagersSnapshot()), len(state.LiveManagersSnapshot()), len(state.WalletsSnapshot()))
+	if len(state.OrderManagersSnapshot()) != 0 || len(state.WalletsSnapshot()) != 0 {
+		t.Fatalf("trading state was not reset: managers=%d wallets=%d",
+			len(state.OrderManagersSnapshot()), len(state.WalletsSnapshot()))
 	}
 }
 

@@ -3,7 +3,6 @@ package biz
 import (
 	"context"
 	"math"
-	"strings"
 	"sync"
 	"testing"
 
@@ -17,8 +16,8 @@ import (
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
-	"github.com/shopspring/decimal"
 	ta "github.com/banbox/banta"
+	"github.com/shopspring/decimal"
 )
 
 type tsCapsMockExchange struct {
@@ -432,7 +431,7 @@ func TestOCOGroupBreakoutStraddleSameBarChronology(t *testing.T) {
 	})
 }
 
-func TestCallbackPctBacktestAndLiveLocalFallback(t *testing.T) {
+func TestCallbackPctBacktest(t *testing.T) {
 	const symbol = "ETH/USDT:USDT"
 	const baseMS = int64(1_700_000_040_000)
 
@@ -460,71 +459,6 @@ func TestCallbackPctBacktestAndLiveLocalFallback(t *testing.T) {
 		if ents[0].Status != ormo.InOutStatusFullExit || ents[0].ExitTag != core.ExitTagTrailingStop {
 			t.Fatalf("pct=%v expected trailing_stop exit, got status=%d tag=%q", pct, ents[0].Status, ents[0].ExitTag)
 		}
-	}
-
-	// 2) LiveOrderMgr fallback to local price-monitored trailing stop when exchange rejects 25% callbackRate.
-	oldBotName := config.Data.Name
-	config.Data.Name = "ts-caps"
-	t.Cleanup(func() { config.Data.Name = oldBotName })
-	var exitSubmitted int
-	exchange := &issue138Exchange{
-		BanExchange: newTSCapsMockExchange(symbol),
-		createOrder: func(sym, odType, side string, amount, price float64, params map[string]interface{}) (*banexg.Order, *errs.Error) {
-			if odType == banexg.OdTypeTrailingStopMarket {
-				return nil, errs.NewMsg(errs.CodeParamInvalid, "callbackRate exceeds exchange max 5%%")
-			}
-			if odType == banexg.OdTypeMarket && side == banexg.OdSideSell {
-				exitSubmitted++
-				return &banexg.Order{
-					ID: "live-trail-exit", Symbol: sym, Type: odType, Side: side,
-					Status: banexg.OdStatusFilled, Amount: amount, Filled: amount, Average: 145, Timestamp: int64(btime.Time()*1000) + 1000,
-				}, nil
-			}
-			return &banexg.Order{ID: "unexpected", Symbol: sym, Status: banexg.OdStatusOpen}, nil
-		},
-	}
-	withIssue138Exchange(t, exchange)
-	mgr := newLiveOrderMgr("live-trail-fallback", func(*ormo.InOutOrder, bool) {})
-	od := issue138Order("filled-entry")
-	od.ID = 901
-	od.Symbol = symbol
-	od.Timeframe = "1m"
-	od.Status = ormo.InOutStatusFullEnter
-	od.InitPrice = 100
-	od.Enter.Symbol = symbol
-	od.Enter.Amount = 1
-	od.Enter.Filled = 1
-	od.Enter.Average = 100
-	od.Enter.Status = ormo.OdStatusClosed
-	od.SetInfo(ormo.OdInfoCallbackPct, 25.0)
-	openOds, lock := mgr.openOrders()
-	lock.Lock()
-	openOds[od.ID] = od
-	lock.Unlock()
-	t.Cleanup(func() {
-		lock.Lock()
-		delete(openOds, od.ID)
-		lock.Unlock()
-	})
-
-	mgr.setTrailingStop(od)
-	if od.GetInfoString(ormo.OdInfoTrailingID) != "" || od.GetInfoInt64(ormo.OdInfoLocalTrailing) != 1 {
-		t.Fatalf("expected fallback to local trailing without failing order, got TrailingID=%q LocalTrailing=%d",
-			od.GetInfoString(ormo.OdInfoTrailingID), od.GetInfoInt64(ormo.OdInfoLocalTrailing))
-	}
-	// Price advances to 200 (SL becomes 150), then drops to 145 <= 150 -> triggers local market exit!
-	if err := mgr.CheckLocalTriggersByPrice(symbol, 200); err != nil {
-		t.Fatal(err)
-	}
-	if exitSubmitted != 0 {
-		t.Fatal("should not exit at peak 200")
-	}
-	if err := mgr.CheckLocalTriggersByPrice(symbol, 145); err != nil {
-		t.Fatal(err)
-	}
-	if exitSubmitted != 1 || od.Status != ormo.InOutStatusFullExit || od.ExitTag != core.ExitTagTrailingStop {
-		t.Fatalf("expected live local fallback trailing exit, exitSubmitted=%d status=%d tag=%q",
-			exitSubmitted, od.Status, od.ExitTag)
 	}
 }
 
@@ -559,71 +493,6 @@ func TestLongShortTPPriceAndExgStopLossFalseLocalEnforcement(t *testing.T) {
 	}
 	if withoutSL.Status != ormo.InOutStatusFullEnter {
 		t.Fatalf("StopLoss==0 order should remain open, got status=%d tag=%q", withoutSL.Status, withoutSL.ExitTag)
-	}
-
-	// 2) LiveOrderMgr: ExgStopLoss=false skips pre-posting remote stop_loss order, yet exits locally on price breach.
-	oldBotName := config.Data.Name
-	config.Data.Name = "ts-caps"
-	t.Cleanup(func() { config.Data.Name = oldBotName })
-	remoteStopOrders := 0
-	marketExits := 0
-	exchange := &issue138Exchange{
-		BanExchange: newTSCapsMockExchange(symbol),
-		createOrder: func(sym, odType, side string, amount, price float64, params map[string]interface{}) (*banexg.Order, *errs.Error) {
-			if strings.Contains(odType, "stop") {
-				remoteStopOrders++
-			}
-			if odType == banexg.OdTypeMarket && side == banexg.OdSideSell {
-				marketExits++
-				return &banexg.Order{
-					ID: "live-local-sl-exit", Symbol: sym, Type: odType, Side: side,
-					Status: banexg.OdStatusFilled, Amount: amount, Filled: amount, Average: 94, Timestamp: int64(btime.Time()*1000) + 1000,
-				}, nil
-			}
-			return &banexg.Order{ID: "other", Symbol: sym, Status: banexg.OdStatusOpen}, nil
-		},
-	}
-	withIssue138Exchange(t, exchange)
-	liveMgr := newLiveOrderMgr("live-local-sl", func(*ormo.InOutOrder, bool) {})
-	od := issue138Order("live-entry-1")
-	od.ID = 902
-	od.Symbol = symbol
-	od.Timeframe = "1m"
-	od.Status = ormo.InOutStatusFullEnter
-	od.InitPrice = 100
-	od.Enter.Symbol = symbol
-	od.Enter.Amount = 1
-	od.Enter.Filled = 1
-	od.Enter.Average = 100
-	od.Enter.Status = ormo.OdStatusClosed
-	od.SetInfo(ormo.OdInfoLocalStopLoss, "1")
-	od.SetInfo(ormo.OdInfoStopLoss, &ormo.TriggerState{ExitTrigger: &ormo.ExitTrigger{Price: 95}})
-	openOds, lock := liveMgr.openOrders()
-	lock.Lock()
-	openOds[od.ID] = od
-	lock.Unlock()
-	t.Cleanup(func() {
-		lock.Lock()
-		delete(openOds, od.ID)
-		lock.Unlock()
-	})
-
-	// Must NOT post remote stop-loss order when OdInfoLocalStopLoss == "1".
-	liveMgr.editTriggerOd(od, ormo.OdActionStopLoss)
-	liveMgr.healMissingFullEnterTriggers([]*ormo.InOutOrder{od}, nil)
-	if remoteStopOrders != 0 {
-		t.Fatalf("expected 0 remote stop-loss orders when ExgStopLoss=false, got %d", remoteStopOrders)
-	}
-	// Bar breach triggers local market stop-loss exit.
-	evt := orm.NewDataSeriesFromKline(&orm.ExSymbol{ID: 1, Symbol: symbol}, "1m", &banexg.Kline{
-		Time: baseMS, Open: 99, High: 100, Low: 94, Close: 94.5, Volume: 100,
-	}, nil, true, true)
-	if err := liveMgr.UpdateByDataSeries([]*ormo.InOutOrder{od}, evt); err != nil {
-		t.Fatal(err)
-	}
-	if remoteStopOrders != 0 || marketExits != 1 || od.Status != ormo.InOutStatusFullExit || od.ExitTag != core.ExitTagStopLoss {
-		t.Fatalf("live ExgStopLoss=false mismatch: remoteStops=%d marketExits=%d status=%d tag=%q",
-			remoteStopOrders, marketExits, od.Status, od.ExitTag)
 	}
 }
 

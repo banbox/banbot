@@ -20,9 +20,9 @@ See [runtime](runtime.md), [live trading](../guide/live_trading.md) and [factor 
 
 ## Capabilities and errors
 
-`ResolveRuntimePriceSymbol(exchange, pair)` returns `([4]string, *errs.Error)` (base/quote/settle/identifier). Adapters parse special symbols; generic symbols can fall back to delimiter parsing. `BuildClientOrderIDChecked` is strict; legacy BuildClientOrderID falls back to an old format on failure and does not prove strict validation succeeded.
+`ResolveRuntimePriceSymbol(exchange, pair)` returns `([4]string, *errs.Error)` (base/quote/settle/identifier). Adapters parse special symbols; generic symbols can fall back to delimiter parsing. `BuildClientOrderID` prefers the adapter capability and falls back to an old format on failure, so it does not prove strict validation succeeded.
 
-`SetOrderCallback(exchange, func(*PutOrderRes) *errs.Error) bool` installs an instance callback and reports support. BotExchange calls it for both successful and failed order submissions. A callback error can replace the original error even when Order is non-nil; inspect both. Explicitly setting nil disables the legacy global AfterCreateOrder fallback.
+The order callback (`SetOrderCallback`, global `AfterCreateOrder`) was removed together with the legacy live stack; `BotExchange` no longer intercepts `CreateOrder`. The `PutOrderRes` type remains only to decode old dumps.
 
 `GetAlignOffForMarket(market *banexg.Market, tfSecs int) int` is the pure-function form that computes the offset (seconds) straight from instrument metadata. `GetAlignOffForExchangeChecked` returns an offset in seconds from instrument trading sessions; nonzero offsets apply to daily and longer periods. Unsupported account export (`StartAccountDownload`/`GetAccountDownload`) and archive URL (`BuildArchiveURL`) capabilities return errors, and no adapter currently implements them; a wrapper function does not imply exchange support. Precision helpers round values/adjust contract quantity units; they do not guarantee funds, minimum order size or a fill.
 

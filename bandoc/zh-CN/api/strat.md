@@ -352,7 +352,7 @@ OnStratExit   func()
 `RegisterStrategy(name, factory)` 注册完整名称，`AddStratGroup` 注册分组。运行中任务从 `rt.Strategies.CollectJobs()` 或 `LookupJob(account, pairTF, strategy)` 获取；包级 `New/Get/GetJobs/GetInfoJobs/AddOdSub/FireOdChange/LoadStratJobs/ExitStratJobs` 是兼容入口，不能查询独立 Runtime 的状态。动态修改品种时在 `PairUpdateReq.StrategyState` 传入所属 `rt.Strategies`；参见[策略指南](../guide/strat_custom.md)。
 
 ### UpdatePairs
-`func (s *TradeStrat) UpdatePairs(req PairUpdateReq) (*PairUpdateResult, *errs.Error)` 在运行中增删品种。`PairUpdateReq{Strat, StrategyState, Core, Exchange, Add, Remove, CloseOnRemove, ForceAdd, Reason}`；`Strat`为空时取接收者，不等于接收者则返回错误。`PairUpdateResult{Added, Removed, Skipped, ExitOrders, Warnings}`。
+`func (s *TradeStrat) UpdatePairs(req PairUpdateReq) (*PairUpdateResult, *errs.Error)` 在运行中增删品种。`PairUpdateReq{Strat, StrategyState, Core, Exchange, Add, Remove, CloseOnRemove, ForceAdd, Reason}`；`Strat`为空时取接收者，不等于接收者则返回错误。`PairUpdateResult{Added, Removed, Skipped, ExitOrders, Warnings}`。仅回测可用：实盘与 dry_run 的 execution 路径中品种在启动时固定，调用返回 `pair updates are not available in this runtime…` 错误。
 
 ### 参数校验
 策略构造函数中可用`pol.Require(cond bool, msg string)`和`pol.Requiref(cond bool, format string, args ...any)`校验参数；不满足时该策略构造失败并按BadConfig（配置错误）报告，不会被缓存，普通运行时错误不会被改写为配置错误。

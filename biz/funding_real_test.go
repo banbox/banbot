@@ -321,7 +321,7 @@ func TestTSDataSubFundingRateSignalAndStreamedRecording(t *testing.T) {
 		t.Fatalf("expected strategy OnData to observe [-0.0004], got %v", gotRates)
 	}
 	pts, hasReal := mgr.symbolFundingPoints(symbol)
-	if !hasReal || len(pts) != 1 || pts[0].atMS != baseMS+stepMS || math.Abs(pts[0].rate+0.0004) > 1e-12 {
+	if !hasReal || len(pts) != 1 || pts[0].AtMS != baseMS+stepMS || math.Abs(pts[0].Rate+0.0004) > 1e-12 {
 		t.Fatalf("expected OrderMgr to record streamed funding point, got %+v (hasReal=%v)", pts, hasReal)
 	}
 }

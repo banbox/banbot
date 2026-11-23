@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/config"
@@ -189,6 +190,12 @@ func runFactorLiveSpecWithArgs(ctx context.Context, args *config.CmdArgs, spec *
 	}
 	if args == nil {
 		args = &config.CmdArgs{}
+	}
+	if err := rejectUnsupportedLiveEnv(spec); err != nil {
+		return err
+	}
+	if err := rejectExecutionDump(args); err != nil {
+		return err
 	}
 	hubMode, err := factorLiveUsesHub(spec.Config(), configs, name)
 	if err != nil {
@@ -552,6 +559,8 @@ func (s *explicitEntrySession) runFactorsLiveWithStartup(ctx context.Context, sn
 	if err != nil {
 		return err
 	}
+	// One reuse window shared by the bridge quote and the account quote source.
+	mixedObserve := execution.ReuseRecentQuotes(adapter.Observe, execution.EmbeddedQuoteReuse)
 	catalog, err := data.RuntimeCatalogFromRegisteredSources()
 	if err != nil {
 		return err
@@ -563,7 +572,9 @@ func (s *explicitEntrySession) runFactorsLiveWithStartup(ctx context.Context, sn
 	}
 	cfg := snapshot.View()
 	if s.runSpec != nil {
-		cfg = mixedLiveAccountConfig(cfg, c.AccountID, mixedLivePolicies(s.runSpec, c.AccountID))
+		root := cfg
+		cfg = mixedLiveAccountConfig(root, c.AccountID, mixedLivePolicies(s.runSpec, c.AccountID))
+		cfg.APIServer = accountDashboardConfig(root, c.AccountID)
 	}
 	opts := biz.SharedExecutionOptions{StorePath: e.StorePath, SenderLeaseDir: e.SenderLeaseDir, Adapter: adapter, AuthoritativeSnapshot: true}
 	var bridge *biz.SharedOrderBridgeConfig
@@ -584,10 +595,17 @@ func (s *explicitEntrySession) runFactorsLiveWithStartup(ctx context.Context, sn
 				return fmt.Errorf("factor: legacy instrument %s requires explicit account SDK mapping", instrument.ID)
 			}
 		}
+		// The runtime registers this function as the account's quote source (the
+		// first registration wins). Reads within EmbeddedQuoteReuse share one REST
+		// book; the factor runner marks its reads with WithQuoteNotBefore (its
+		// executable time), so it never receives a quote observed earlier.
 		copyBridge.QuoteContext = func(ctx context.Context, id string, _ int64) (execution.VisibleQuote, error) {
-			return adapter.Observe(ctx, id)
+			return mixedObserve(ctx, id)
 		}
 		copyBridge.DefaultLimitPrice = adapter.DefaultLimitPrice
+		if err := copyBridge.Validate(); err != nil {
+			return err
+		}
 		bridge = &copyBridge
 	}
 	opts.TakeoverStrategy, err = executionTakeoverOwner(cfg, bridge)
@@ -598,12 +616,43 @@ func (s *explicitEntrySession) runFactorsLiveWithStartup(ctx context.Context, sn
 	if len(sourceOptions) > 0 {
 		planOptions = sourceOptions[0]
 	}
-	rt, err := s.process.NewRuntime(runtime.Options{Context: ctx, Logger: s.logger, Config: cfg, DataDir: snapshot.DataDir, StrategyDir: snapshot.StrategyDir, Mode: core.RunModeLive, Env: cfg.Env, Exchange: s.exchange, Storage: s.storage, ExchangeName: cfg.Exchange.Name, Market: cfg.MarketType, ContractType: cfg.ContractType, Pairs: cfg.Pairs, Catalog: catalog, AccountOwnerKey: &binding.Account, SharedExecution: &opts, SharedOrderBridge: bridge, SharedMarketData: true, SourcePlanOptions: planOptions, NetDisable: s.netDisable, DisplayLocation: snapshot.Location()})
+	// The time-series part of a mixed account trades through biz.HubOrderMgr
+	// over an in-process Hub port onto this very account (SharedOrderMgr is
+	// backtest-only). The factor runner below keeps using the borrowed account
+	// directly, with strategy IDs distinct from the bridge's.
+	var hubBridge *biz.HubOrderBridgeConfig
+	if bridge != nil {
+		borrow, err := s.process.BorrowAccount(binding.Account, opts)
+		if err != nil {
+			return err
+		}
+		defer borrow.Release()
+		embedded, err := execution.NewEmbeddedHub(ctx, borrow.Service(), time.Second)
+		if err != nil {
+			return err
+		}
+		// Registered before the runtime: runs after rt.Close, once the
+		// HubOrderMgr no longer polls the port.
+		defer func() { resultErr = errors.Join(resultErr, embedded.Close()) }()
+		if hubBridge, err = tsHubLocalBridge(snapshot, binding.Account, *bridge, embedded.Port()); err != nil {
+			return err
+		}
+	}
+	rt, err := s.process.NewRuntime(runtime.Options{Context: ctx, Logger: s.logger, Config: cfg, DataDir: snapshot.DataDir, StrategyDir: snapshot.StrategyDir, Mode: core.RunModeLive, Env: cfg.Env, Exchange: s.exchange, Storage: s.storage, ExchangeName: cfg.Exchange.Name, Market: cfg.MarketType, ContractType: cfg.ContractType, Pairs: cfg.Pairs, Catalog: catalog, AccountOwnerKey: &binding.Account, SharedExecution: &opts, HubOrderBridge: hubBridge, SharedMarketData: true, SourcePlanOptions: planOptions, NetDisable: s.netDisable, DisplayLocation: snapshot.Location()})
 	if err != nil {
 		return err
 	}
 	defer func() { rt.Close(); rt.Join() }()
+	// Notifications (rpc_channels) for this execution-backed runtime; never fails the robot.
+	defer attachRuntimeNotifications(rt)()
 	rt.Core.LogFile = s.logArgs.Logfile
+	warnIgnoredExecutionConfig(snapshot.View())
+	// Embedded mode holds the account credentials. The execution-backed order
+	// managers do not honour AccountConfig.NoTrade, so a failed check stops the
+	// robot (fail closed) instead of silently trading a misconfigured account.
+	if checkErr := verifyEmbeddedAccounts(rt.BizDeps()); checkErr != nil {
+		return checkErr
+	}
 	for _, symbol := range binding.Symbols {
 		if err := rt.Symbols.CacheExSymbolChecked(symbol); err != nil {
 			return err
@@ -615,7 +664,7 @@ func (s *explicitEntrySession) runFactorsLiveWithStartup(ctx context.Context, sn
 		instruments = append(instruments, i.Instrument)
 	}
 	if err := account.RegisterAccountQuotes(instruments, func(ctx context.Context, id string, _ int64) (execution.VisibleQuote, error) {
-		return adapter.Observe(ctx, id)
+		return mixedObserve(ctx, id)
 	}, rt.Clock.TimeMS); err != nil {
 		return err
 	}
@@ -673,25 +722,30 @@ func (s *explicitEntrySession) runFactorsLiveWithStartup(ctx context.Context, sn
 	if err != nil {
 		return err
 	}
-	if autoLegacy {
-		if err := loadMixedLiveJobs(rt, &binding); err != nil {
+	if binding.Legacy != nil {
+		if err := bindTimeSeriesJobs(func() error {
+			if autoLegacy {
+				return loadMixedLiveJobs(rt, &binding)
+			}
+			return rt.BindFactorLegacyJobs(binding.Legacy.Jobs, binding.Legacy.Subscriptions)
+		}); err != nil {
 			return err
 		}
 	}
-	if binding.Legacy != nil && !autoLegacy {
-		if err := rt.BindFactorLegacyJobs(binding.Legacy.Jobs, binding.Legacy.Subscriptions); err != nil {
-			return err
-		}
+	// See runFactorHubAccount: *errs.Error values stay in dedicated variables.
+	trader, traderErr := live.NewCryptoTraderWithRuntimeDeps(rt.BizDeps())
+	if traderErr != nil {
+		return traderErr
+	}
+	if apiErr := trader.StartWebAPI(); apiErr != nil {
+		return apiErr
 	}
 	if startup != nil {
-		trader, err := live.NewCryptoTraderWithRuntimeDeps(rt.BizDeps(), nil)
-		if err != nil {
-			return err
-		}
 		if err := startup(ctx, trader); err != nil {
 			return err
 		}
 	}
+	rt.NotifyStarted()
 	group := runner.NewComputationGroup()
 	engines := make([]*runner.Live, 0, len(configs))
 	intervals := make([]int64, 0, len(configs))
@@ -761,13 +815,25 @@ func (s *explicitEntrySession) runFactorsLiveWithStartup(ctx context.Context, sn
 	if err != nil {
 		return err
 	}
+	startExecutionRobotCrons(rt, trader, provider, legacySubscriptions(&binding))
 	streamErrors := sourceOwner.Errors()
 	var result error
+	// Only a time-series order manager can stop the runtime by itself.
+	var runtimeDone <-chan struct{}
+	if hubBridge != nil {
+		runtimeDone = rt.Context().Done()
+	}
 	select {
 	case <-sourceOwner.Done():
 	case result = <-failures:
 	case result = <-streamErrors:
 	case result = <-reports:
+	case <-runtimeDone:
+		// A failed HubOrderMgr stops the runtime; the account is frozen.
+		result = hubRobotRuntimeError(rt, c.AccountID)
+		if manager, ok := biz.GetOdMgrWithState(rt.Trading, c.AccountID).(*biz.HubOrderMgr); ok && manager.LastError() != nil {
+			result = errors.Join(result, account.FreezeFailure("time-series-hub-facade-error", rt.Clock.TimeMS()))
+		}
 	case <-ctx.Done():
 		result = ctx.Err()
 	}

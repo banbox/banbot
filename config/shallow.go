@@ -11,7 +11,10 @@ func hasPolicyEngine(fields map[string]any) bool {
 	return fields["engine"] == EngineTimeSeries || fields["engine"] == EngineFactor
 }
 
-var accountExecutionKeys = strings.Fields("mode store history sender_lease_dir hub_socket live_provider funding_policy protection_mode order_mode near_limit_bps paper_fill_model instruments margin_rate max_account_margin max_virtual_gross strategy_gross_limit")
+// ts_facade is a removed key: it stays in the allowed list only so that
+// validateAdvanced can reject it with an explicit message instead of the generic
+// unknown-field error.
+var accountExecutionKeys = strings.Fields("ts_facade mode store history sender_lease_dir hub_socket live_provider funding_policy protection_mode order_mode near_limit_bps paper_fill_model instruments margin_rate max_account_margin max_virtual_gross strategy_gross_limit")
 var factorPolicyKeys = strings.Fields("archive chunks snapshot combo portfolio decision research manifest prices funding_source initial_nav max_records definition expressions option_expiry_source terminal_settlement_source pit_min_universe_ratio pit_delist_penalty_bps universe rolling_universe")
 
 func factorFields(fields map[string]any) map[string]any {

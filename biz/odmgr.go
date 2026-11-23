@@ -7,7 +7,6 @@ import (
 	"maps"
 	"math"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 
@@ -29,8 +28,7 @@ import (
 )
 
 var (
-	accOdMgrs     = make(map[string]IOrderMgr)
-	accLiveOdMgrs = make(map[string]*LiveOrderMgr)
+	accOdMgrs = make(map[string]IOrderMgr)
 )
 
 const ExitTagOCOCancel = "oco_cancel"
@@ -48,26 +46,14 @@ type IOrderMgr interface {
 	CleanUp() *errs.Error
 }
 
-type IOrderMgrLive interface {
-	IOrderMgr
-	SyncExgOrders() ([]*ormo.InOutOrder, []*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error)
-	WatchMyTrades()
-	TrialUnMatchesForever()
-	ConsumeOrderQueue()
-}
-
 type FuncHandleIOrder = func(order *ormo.InOutOrder) *errs.Error
 
 // runtimeOrderConfig is the immutable, hot-path view of configuration needed
 // by one order manager. It is copied when the manager is bound so Runtime
 // order processing never consults the process-wide config facade.
 type runtimeOrderConfig struct {
-	stakeCurrency        []string
-	takeOverStrategy     string
 	orderType            string
 	limitVolSecs         int
-	putLimitSecs         int
-	orderBookTTL         int64
 	stopEnterBars        int
 	maxOpenOrders        int
 	maxSimulOpen         int
@@ -83,10 +69,7 @@ type runtimeOrderConfig struct {
 	accountMaxOpenOrders int
 }
 
-type fundingRatePoint struct {
-	atMS int64
-	rate float64
-}
+type fundingRatePoint = execution.FundingPoint
 
 type OrderMgr struct {
 	callBack        func(order *ormo.InOutOrder, isEnter bool)
@@ -123,46 +106,11 @@ func accountMaxOpenOrders(accounts map[string]*config.AccountConfig, account str
 	return 0
 }
 
-func (o *OrderMgr) stakeCurrency() []string {
-	if o != nil && o.runtimeDeps {
-		return o.runtimeCfg.stakeCurrency
-	}
-	return config.StakeCurrency
-}
-
-func (o *OrderMgr) takeOverStrategy() string {
-	if o != nil && o.runtimeDeps {
-		return o.runtimeCfg.takeOverStrategy
-	}
-	return config.TakeOverStrat
-}
-
 func (o *OrderMgr) orderType() string {
 	if o != nil && o.runtimeDeps {
 		return o.runtimeCfg.orderType
 	}
 	return config.OrderType
-}
-
-func (o *OrderMgr) limitVolSecs() int {
-	if o != nil && o.runtimeDeps {
-		return o.runtimeCfg.limitVolSecs
-	}
-	return config.LimitVolSecs
-}
-
-func (o *OrderMgr) putLimitSecs() int {
-	if o != nil && o.runtimeDeps {
-		return o.runtimeCfg.putLimitSecs
-	}
-	return config.PutLimitSecs
-}
-
-func (o *OrderMgr) orderBookTTL() int64 {
-	if o != nil && o.runtimeDeps {
-		return o.runtimeCfg.orderBookTTL
-	}
-	return config.OdBookTtl
 }
 
 func (o *OrderMgr) stopEnterBars() int {
@@ -207,18 +155,6 @@ func (o *OrderMgr) accountLeverage() float64 {
 		return 1 // An omitted leverage must not cause infinite margin requirements.
 	}
 	return leverage
-}
-
-func (o *OrderMgr) takeOverTF(pair, defTF string) string {
-	if o == nil || !o.runtimeDeps {
-		return config.GetTakeOverTF(pair, defTF)
-	}
-	if o.runtimeCore != nil {
-		if tf, ok := o.runtimeCore.StrategyTimeFrame(o.takeOverStrategy(), pair); ok && tf != "" {
-			return tf
-		}
-	}
-	return defTF
 }
 
 func (o *OrderMgr) priceNow() int64 {
@@ -346,16 +282,6 @@ func (o *OrderMgr) runMode() string {
 		return ""
 	}
 	return core.RunMode
-}
-
-func (o *OrderMgr) runEnv() string {
-	if o != nil && o.runtimeDeps {
-		if o.runtimeCore != nil {
-			return o.runtimeCore.RunEnv
-		}
-		return ""
-	}
-	return core.RunEnv
 }
 
 func (o *OrderMgr) pairIsBanned(pair string, nowMS int64) bool {
@@ -519,7 +445,7 @@ func (o *OrderMgr) updateOrderFee(od *ormo.InOutOrder, price float64, forEnter b
 	if exOrder == nil {
 		return errs.NewMsg(errs.CodeRunTime, "fee order is nil for %s", od.Symbol)
 	}
-	fee, err := execution.LegacyOrderFee(exchange, exOrder.Symbol, &exOrder.OrderType,
+	fee, err := exg.OrderFee(exchange, exOrder.Symbol, &exOrder.OrderType,
 		exOrder.Side, exOrder.Filled, price)
 	if err != nil {
 		return err
@@ -565,11 +491,11 @@ func (o *OrderMgr) RecordFundingSeries(symbol string, evt *orm.DataSeries) {
 		o.fundingStreamed = make(map[string][]fundingRatePoint)
 	}
 	pts := o.fundingStreamed[symbol]
-	if n := len(pts); n > 0 && pts[n-1].atMS == atMS {
-		pts[n-1].rate = rate
+	if n := len(pts); n > 0 && pts[n-1].AtMS == atMS {
+		pts[n-1].Rate = rate
 		return
 	}
-	o.fundingStreamed[symbol] = append(pts, fundingRatePoint{atMS: atMS, rate: rate})
+	o.fundingStreamed[symbol] = append(pts, fundingRatePoint{AtMS: atMS, Rate: rate})
 }
 
 func (o *OrderMgr) symbolFundingPoints(symbol string) ([]fundingRatePoint, bool) {
@@ -620,7 +546,7 @@ func (o *OrderMgr) symbolFundingPoints(symbol string) ([]fundingRatePoint, bool)
 							atMS = row.TimeMS
 						}
 						if atMS > 0 {
-							stored = append(stored, fundingRatePoint{atMS: atMS, rate: rate})
+							stored = append(stored, fundingRatePoint{AtMS: atMS, Rate: rate})
 						}
 					}
 				}
@@ -661,31 +587,7 @@ func extractFundingRateFloat(raw any) (float64, bool) {
 }
 
 func mergeFundingRatePoints(a, b []fundingRatePoint) []fundingRatePoint {
-	if len(b) == 0 {
-		return a
-	}
-	if len(a) == 0 {
-		cp := append([]fundingRatePoint(nil), b...)
-		sort.SliceStable(cp, func(i, j int) bool { return cp[i].atMS < cp[j].atMS })
-		return dedupeFundingRatePoints(cp)
-	}
-	cp := make([]fundingRatePoint, 0, len(a)+len(b))
-	cp = append(cp, a...)
-	cp = append(cp, b...)
-	sort.SliceStable(cp, func(i, j int) bool { return cp[i].atMS < cp[j].atMS })
-	return dedupeFundingRatePoints(cp)
-}
-
-func dedupeFundingRatePoints(pts []fundingRatePoint) []fundingRatePoint {
-	out := pts[:0]
-	for _, pt := range pts {
-		if len(out) > 0 && out[len(out)-1].atMS == pt.atMS {
-			out[len(out)-1] = pt
-			continue
-		}
-		out = append(out, pt)
-	}
-	return out
+	return execution.MergeFundingPoints(a, b)
 }
 
 // settleBacktestFunding settles bilateral perpetual funding over (enterMS, exitMS]
@@ -733,13 +635,7 @@ func (o *OrderMgr) settleBacktestFundingWithMode(od *ormo.InOutOrder, aprPct flo
 	if od.Short {
 		signedNotional = -notional
 	}
-	startIdx := sort.Search(len(pts), func(i int) bool { return pts[i].atMS > enterMS })
-	var totalCost float64
-	crossed := 0
-	for i := startIdx; i < len(pts) && pts[i].atMS <= exitMS; i++ {
-		totalCost += signedNotional * pts[i].rate
-		crossed++
-	}
+	totalCost, crossed := execution.RealFundingCost(pts, signedNotional, enterMS, exitMS)
 	od.SetInfo("funding_mode", "real")
 	if crossed == 0 || totalCost == 0 {
 		od.SetInfo("funding", 0.0)
@@ -788,12 +684,8 @@ func addApproxFundingWithMode(od *ormo.InOutOrder, aprPct float64, contract, inv
 	od.SetInfo("funding", cost)
 }
 
-// fundingApproxCost is notional x apr% x (holdMS in years).
 func fundingApproxCost(notional, aprPct float64, holdMS int64) float64 {
-	if aprPct == 0 || math.IsNaN(aprPct) || math.IsInf(aprPct, 0) || notional <= 0 || holdMS <= 0 {
-		return 0
-	}
-	return notional * aprPct / 100 * float64(holdMS) / (365 * 86400000)
+	return execution.ApproxFundingCost(notional, aprPct, holdMS)
 }
 
 func (o *OrderMgr) localExit(od *ormo.InOutOrder, exitAt int64, tag string, price float64, msg, odType string) *errs.Error {
@@ -892,20 +784,10 @@ func makeRuntimeOrderConfig(deps RuntimeDeps, account string) runtimeOrderConfig
 	if cfg == nil {
 		return result
 	}
-	result.stakeCurrency = cfg.StakeCurrency
-	result.takeOverStrategy = cfg.TakeOverStrat
 	result.orderType = cfg.OrderType
 	result.limitVolSecs = cfg.LimitVolSecs
 	if result.limitVolSecs == 0 {
 		result.limitVolSecs = 10
-	}
-	result.putLimitSecs = cfg.PutLimitSecs
-	if result.putLimitSecs == 0 {
-		result.putLimitSecs = 180
-	}
-	result.orderBookTTL = cfg.OdBookTtl
-	if result.orderBookTTL == 0 {
-		result.orderBookTTL = 500
 	}
 	result.stopEnterBars = cfg.StopEnterBars
 	result.maxOpenOrders = cfg.MaxOpenOrders
@@ -960,13 +842,6 @@ func (o *OrderMgr) taskID() int64 {
 		return state.GetTaskID(o.Account)
 	}
 	return ormo.GetTaskID(o.Account)
-}
-
-func (o *OrderMgr) taskAccount(taskID int64) string {
-	if state := o.orderState(); state != nil {
-		return state.GetTaskAcc(taskID)
-	}
-	return ormo.GetTaskAcc(taskID)
 }
 
 // exSymbolCur resolves through the manager-owned symbol catalog for typed
@@ -1155,56 +1030,10 @@ func GetAllOdMgrWithState(state *TradingState) map[string]IOrderMgr {
 
 func GetAllOdMgr() map[string]IOrderMgr {
 	var result = make(map[string]IOrderMgr)
-	if core.EnvReal {
-		for acc, mgr := range accLiveOdMgrs {
-			result[acc] = mgr
-		}
-	} else {
-		for acc, mgr := range accOdMgrs {
-			result[acc] = mgr
-		}
+	for acc, mgr := range accOdMgrs {
+		result[acc] = mgr
 	}
 	return result
-}
-
-func GetLiveOdMgr(account string) *LiveOrderMgr {
-	if !core.EnvReal {
-		panic("call GetLiveOdMgr in FakeEnv is forbidden: " + core.RunEnv)
-	}
-	val, _ := accLiveOdMgrs[account]
-	return val
-}
-
-// GetLiveOdMgrWithState resolves a live manager from an explicit runtime.
-func GetLiveOdMgrWithState(state *TradingState, account string) *LiveOrderMgr {
-	if state == nil {
-		return nil
-	}
-	return state.LiveManager(account)
-}
-
-func CleanUpOdMgr() *errs.Error {
-	var err *errs.Error
-	for account := range executionAccountNames() {
-		var curErr *errs.Error
-		if core.EnvReal {
-			if mgr, ok := accLiveOdMgrs[account]; ok {
-				curErr = mgr.CleanUp()
-			}
-		} else {
-			if mgr, ok := accOdMgrs[account]; ok {
-				curErr = mgr.CleanUp()
-			}
-		}
-		if curErr != nil {
-			if err != nil {
-				log.Error("clean odMgr fail", zap.String("acc", account), zap.Error(curErr))
-			} else {
-				err = curErr
-			}
-		}
-	}
-	return err
 }
 
 // CleanUpOdMgrWithState closes only managers owned by an explicit runtime.
@@ -2161,15 +1990,7 @@ func (o *OrderMgr) CleanUp() *errs.Error {
 }
 
 func CloseAccOrders(acc string, odList []*ormo.InOutOrder, req *strat.ExitReq) (int, int, *errs.Error) {
-	var odMgr IOrderMgr
-	if core.EnvReal {
-		// Avoid wrapping a nil *LiveOrderMgr into a non-nil interface.
-		if live := GetLiveOdMgr(acc); live != nil {
-			odMgr = live
-		}
-	} else {
-		odMgr = GetOdMgr(acc)
-	}
+	odMgr := GetOdMgr(acc)
 	if odMgr == nil {
 		return 0, len(odList), errs.NewMsg(errs.CodeRunTime, "order manager not found for account: %s", acc)
 	}

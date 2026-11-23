@@ -10,7 +10,8 @@ public inputs, computation and projections, not execution accounts or private
 streams. Explicit registered production embedding providers remain opt-in and
 cannot be mixed with Hub accounts in one robot. Dry-run entries reject embedded
 live adapters. Backtests remain in-process. Starting Hub
-does not take over a running legacy sender: stop/migrate that owner first.
+does not take over positions of an older pre-execution bot process: stop and
+migrate that owner first.
 Default routing is implemented, but complete historical configuration parity
 and real-venue production acceptance remain separate requirements.
 
@@ -40,7 +41,16 @@ endpoints/proxies from those options are not currently supported by hub.
 
 ## Private account protocol
 
-`execution.NewHubClient(socketPath)` exposes:
+`execution.NewHubClient(socketPath)` exposes the methods of `execution.HubPort`
+(the robot-side interface `biz.HubOrderBridgeConfig.Client` uses). An embedded
+production time-series robot may use `execution.EmbeddedHub` /
+`LocalHubPort` instead (the only facade of that robot, and of the time-series part of a
+mixed factor + time-series robot, whose factor runner uses the same borrowed account
+directly; the former `execution.ts_facade` rollback key was removed): the same calls are
+JSON-encoded and answered by the Hub request handler in-process, so error
+mapping, size limits and copy semantics match; the Hub wraps the robot's own
+`SharedAccount`, never closes it, always admits pending feeds, and runs a 1 s
+pending tick that only logs failures. It has no socket and no market stream. The full client surface:
 
 - `ClaimStrategyWriter`: a stable per-session writer ID and expected epoch CAS
   claim a durable strategy epoch. Target, pending, TS-exit and policy commands
@@ -59,6 +69,23 @@ endpoints/proxies from those options are not currently supported by hub.
   retries never cancel a later order generation. An interrupted accepted command
   remains fenced across reconciliation/restart and requires controlled recovery;
   it is not blindly rerun. No operator completion tool is implemented yet.
+- `SetLossStopPolicy`, `LossStopStatus`: the account loss circuit breaker.
+- `SetAdmissionPolicy`, `AdmissionStatus` (`admission_policy.go`): the account
+  time-series entry limits `max_open_orders` / `max_simul_open`, enforced by the
+  owner in `ApplyPendingCommand` create (typed `admission_limit`) across every
+  robot of the account. Each robot registers its limits under its writer id; the
+  owner keeps the most restrictive non-zero value per field, a registrant
+  replaces only its own entry, an empty policy deregisters it. Open lots are the
+  held or actively pending lots carrying `TimeSeriesMetadata`. A bar round is the
+  request timeframe window aligned from `Metadata.CreatedMS` (the robot clock);
+  the newest round is kept and an older-round request counts in it; `ws` has no
+  round. The robot-side check stays as the early filter (and covers per-strategy
+  limits, each strategy having one writer lease); state is checkpointed under
+  `account-risk/admission-v1` and committed with the accepted create.
+  The owner samples marked equity, compares it with each configured window and
+  persists a pause shared by every robot. It measures and reports; robots must
+  query it before freezing an entry command, because the owner does not refuse
+  an entry command that already arrived.
 - `RecoveryStatuses`: credential-free account lifecycle and outstanding
   reauthentication obligations. Known accounts are not silently forgotten on
   restart and are not reported as active before their factory succeeds.
@@ -96,6 +123,10 @@ endpoints/proxies from those options are not currently supported by hub.
   remaining entry can resume. Metadata, revisions, acceptance events, receipt,
   pending book and target plan commit together. Retry the same command ID and
   payload after a lost ACK. This is not an all-strategy atomic batch.
+- `Snapshot`, `VisibleQuote`: read-only queries. Factor-only Hub robots and the
+  time-series path read account metrics through them with a 1 s cache and a 3 s
+  timeout per refresh (`biz/hub_account_reader.go`); a robot never sends commands
+  through that reader.
 - `TimeSeriesProjection`: captures snapshot, pending book, TS metadata and a
   bounded committed-event page inside account admission. An explicit terminal
   lot list retains access to closed presentation records. Reads do not advance
@@ -120,6 +151,19 @@ commands accept timestamp expiry, not quote-bar expiry. They use the lot's
 existing placement policy and never accept client-authored runtime/venue state.
 These per-lot commands remain distinct from `ApplyTimeSeriesExit`, which owns
 cross-lot selection and budget consumption.
+
+Owner refusals. Preparing a plan is one local transaction, so a refusal leaves
+no receipt, revision, plan or pending definition behind. A closed set of codes
+(`limit_off_tick`, `risk_limit`, `spot_short`, `self_cross`, `admission_limit`,
+`account_not_ready`, `stale_entry`, plus `venue_minimum`) is classified by `RejectedError` (`hub_rejection.go`); the RPC
+returns the fixed code in `Rejected`, never error text, and the client restores
+`ErrVenueMinimum` or `*RejectedError`. `venue_minimum` is reported for any
+operation. The other codes are reported only for `ApplyPendingCommand` `create`:
+refusing an exit, edit or protection change can stem from another lot of the
+same combined plan, and dropping it would leave a position unmanaged, so those
+stay a generic failure. A refused command must not be resent unchanged. Order
+prices (limits, not trigger levels) are checked against the instrument tick at
+admission (`limit_off_tick`).
 
 `PendingCommand.Metadata` now commits typed TS selector/presentation identity and
 an opaque JSON payload with the pending plan. Typed identity cannot change on
@@ -194,7 +238,30 @@ multi-user or strategy-level authorization. No network/private TCP transport is
 provided. Existing sockets are not unlinked or taken over, and shutdown only
 unlinks the socket inode it created. After an unclean host crash, stale-socket
 recovery requires verifying that the old owner is stopped; there is no automatic
-takeover. Credential-bearing factory errors are not returned over RPC.
+takeover. Credential-bearing factory errors are not returned over RPC; the CLI host
+writes the failed operation and its error to its own private log instead.
+
+When one strategy's exits of a long lot and a short lot of the same instrument
+meet in one plan (exit all, or a long take-profit and a short stop in one tick),
+the owner crosses them internally: both lots close at the same price with no venue
+order. Other same-strategy oppositions (opening both directions, flips) are refused
+as `self_cross` and sequenced as described next.
+
+A private trade report that carries our client ID and an exchange ID the submit
+receipt has not recorded yet (an instant market fill) is attributed to that order
+(`storedIdentity`); the report only wakes recovery. Two different recorded exchange
+IDs still conflict.
+
+When the autonomous pending tick is refused, the owner first sequences opposite
+deltas of one strategy after `self_cross` (`pending_sequence.go`: reductions are
+executed and the opposite increase waits one tick; two opposite reductions are
+ordered by consecutive hold count, then lowest lot ID), then isolates a
+deterministic refusal to one admitted, increasing, not-yet-working entry
+(`pending_isolation.go`: at most 8 exclusions, the entry ends `Canceled` with a
+`pending-isolated:<lot>` checkpoint and a `StrategyAcceptedEvent` carrying
+`Rejected`). Unclassified errors, errors after commit, reductions and entries
+that never passed owner admission (the backtest-only `SharedOrderMgr` writes its
+pending book directly) still fail the step and freeze the account.
 
 Recovered contributor/instrument bindings are validated before a market worker
 can execute pending orders. Account-owned market subscriptions continue after
@@ -229,6 +296,30 @@ Already owned by execution:
 - Pending entry/exit policies, stops, trailing and exclusive-lot venue delegation.
 - Volume/depth default limit pricing and proven external-trade attribution.
 - Independent private-report worker and periodic order/funding reconciliation.
+  A 5 s tick only advances pending execution while the account is reconciled; a full
+  venue snapshot (balance, positions, all open and conditional orders) runs every
+  30 s (`privateReconcileInterval`), and sooner on an account-change wake-up, an order
+  report or a transient outage. Funding (`RecoverCash`) is fetched on demand when
+  reconciliation finds a settled cash mismatch (then reconciled once more) and at most
+  every 5 minutes otherwise (the embedded time-series entry does not poll it itself); a mismatch that survives the fetch still freezes the account.
+  Transient venue read failures (network, timeout, rate limit, temporary ban, overload,
+  indeterminate result, deadline, `ErrAccountQuoteNotVisible`) skip the tick instead of
+  freezing: the account stays unready, new entries are refused with `account_not_ready`,
+  WARN is logged at the start, ERROR after 1 minute, INFO on recovery, and a rate limit
+  pauses polling for the venue Retry-After (default 30 s). Every other error freezes the
+  account and logs `account frozen by the private report worker` with reason and error.
+- Embedded quote reuse: the embedded time-series entry wraps `BanexgAdapter.Observe` with
+  `ReuseRecentQuotes` (`EmbeddedQuoteReuse`, 1 s) for the bridge `QuoteContext` and the
+  account's registered quote source: reads of one instrument within 1 s reuse the last valid
+  quote, concurrent reads share one REST request, failures are not cached. Mixed accounts use
+  the same wrapper; the factor runner marks its reads with `WithQuoteNotBefore` (its
+  executable time), so it is refetched rather than served a quote observed earlier.
+- Clock tolerance: `observedBookMS` accepts a book stamped up to 1 s ahead of local receipt
+  (observed at receipt time) for the market stream, `Observe` and default limit pricing.
+- Account market stream: REST quote snapshots and the websocket wake-up subscription
+  request 5 depth levels (`accountQuoteDepthLevels`; a self-contained partial-depth stream
+  where the venue offers one), fall back to the SDK default when the venue reports the
+  limit as invalid, and REST snapshots are spaced at least min(TTL/4, 1 s) per instrument.
 - Capability-gated normalized private balance and position subscriptions. Pushes only
   wake authoritative order/funding/account reconciliation, never overwrite cash
   from an incomplete push. A failed subscription or closed subscribed source
@@ -247,8 +338,9 @@ Still outside the required final boundary:
 - `biz/shared_order_mgr.go` still uses `WithState` closures to access the local
   Store, coordinate requests, commit TS/pending checkpoints and project orders.
   These closures cannot be transparently serialized or replaced with SDK RPC.
-- Pure TS dry-run still selects `LocalLiveOrderMgr`; adding hub does not change
-  that route. Factor and mixed routes also need an explicit local/remote seam.
+- Pure TS dry-run runs through the execution path (the legacy
+  `LocalLiveOrderMgr` route was removed). Factor and mixed routes also need an
+  explicit local/remote seam.
 - Serializable pending create/limit-edit/cancel/protection and per-lot exit
   commands, atomic TS metadata and strategy-scoped cross-lot exits now exist.
   `biz/time_series_command_bridge.go` converts defaulted strategy requests to
@@ -261,7 +353,9 @@ Still outside the required final boundary:
   position pushes also remain unwired. Hub-owned closed-series feed expiry is not wired to
   spider ingestion; forwarding observations from a robot is not equivalent.
 - Spot/inverse/dated/hedge, dynamic leverage, fatal-stop windows and unproven
-  native conditional/trailing scenarios retain the TS migration safety fences.
+  native conditional/trailing scenarios retain the TS migration safety fences;
+  the support matrix with migration notes is in
+  `doc/project/05_biz_orders_live.md`.
 
 ## Required before robot cutover
 
@@ -305,8 +399,23 @@ acknowledges the captured snapshot without dispatching historical callbacks.
 `<datadir>/execution/robots` freezes commands, writer identity/sequence and
 projection/callback progress; it is not an execution ledger. Keep it across
 robot restarts, and do not invent new command identities to resolve lost ACKs.
-Each journal has a single-process file lease. Default liquidity-based limit
+Each journal has a single-process file lease. The embedded facade's journal is
+`execution/robots/ts-local-<hash>.json`, distinct from a socket robot's and
+never shared with it. Default liquidity-based limit
 prices come from the account owner's `DefaultLimitPrice` RPC, not robot-side
 SDK calls. Legacy arbitrary RelayOrders imports are explicitly rejected.
-Owner-wide historical order-count limits, dynamic leverage/fatal-stop, native
-conditional parity and multi-leg execution groups remain compatibility work.
+Take-profit ladders (`TakeProfits`) are not an owner concept and the robot
+orchestrates them over `set_protections` follow-ups; OCO entry groups
+(`OCOGroup`, carried by `PendingCreateSpec.OCOGroup`) are enforced by the owner
+and the robot additionally sends `cancel_entry` follow-ups (see `biz/hub_order_ladder.go`). The owner keeps one
+take-profit per lot, and `set_protections` resets the lot's protection runtime
+state, including the trailing anchor. Two OCO members executable in the same
+owner tick are not both filled: the owner resolves OCO groups itself
+(`pending_oco.go`, before coordination, in the autonomous tick and in command
+admission). Of several members executable in one tick only the earliest-created
+stays (`oco_simultaneous`), and once a member has a fill its open unfilled
+siblings are cancelled (`oco_filled_sibling`); members that already have fills,
+live orders, reservations or exits are never cancelled (all filled members stay,
+with a WARN). Owner-wide historical order-count limits, per-order
+dynamic leverage, native conditional parity and multi-leg execution groups
+beyond these two remain compatibility work.

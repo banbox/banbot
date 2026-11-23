@@ -12,6 +12,17 @@ import (
 	"github.com/shopspring/decimal"
 )
 
+// semanticMigrationAdapter records the intents submitted to the paper venue.
+type semanticMigrationAdapter struct {
+	*runner.PaperAdapter
+	submits []execution.OrderIntent
+}
+
+func (a *semanticMigrationAdapter) Submit(ctx context.Context, o execution.OrderIntent, client string) (execution.SubmitReceipt, error) {
+	a.submits = append(a.submits, o)
+	return a.PaperAdapter.Submit(ctx, o, client)
+}
+
 func TestSharedDelayedFundingExternalActivityAndFeeOnlyBoundaries(t *testing.T) {
 	for _, activity := range []string{"external-ETH", "external-BTC", "fee-only-BTC"} {
 		t.Run(activity, func(t *testing.T) {

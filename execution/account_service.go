@@ -558,38 +558,6 @@ func (b *SharedAccountBorrow) Rebalance(request CombinedRebalance, nowMS int64) 
 	})
 }
 
-func (b *SharedAccountBorrow) RebalanceAtCheckpoint(request CombinedRebalance, checkpoint, nowMS int64) error {
-	return b.use(func(s *SharedAccount) error {
-		current, err := s.store.Snapshot(b.ctx)
-		if err != nil {
-			return err
-		}
-		if current.Checkpoint != checkpoint {
-			return ErrSharedCheckpoint
-		}
-		return s.rebalance(request, nowMS, b.ctx)
-	})
-}
-
-// RebalanceAtVersion also fences target-only plan changes, which need not
-// change a cash/fill checkpoint. Callers rebuild on ErrSharedCheckpoint.
-func (b *SharedAccountBorrow) RebalanceAtVersion(request CombinedRebalance, checkpoint int64, expectedPlanID string, nowMS int64) error {
-	return b.use(func(s *SharedAccount) error {
-		current, err := s.store.Snapshot(b.ctx)
-		if err != nil {
-			return err
-		}
-		latest, err := s.store.LatestPlan(b.ctx)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return err
-		}
-		if current.Checkpoint != checkpoint || latest.ID != expectedPlanID {
-			return ErrSharedCheckpoint
-		}
-		return s.rebalance(request, nowMS, b.ctx)
-	})
-}
-
 func (s *SharedAccount) executorFor(ctx context.Context) *OwnerExecutor {
 	executor := *s.executor
 	executor.Context = ctx

@@ -94,7 +94,10 @@ func (r *Runtime) BindFactorLegacyJobs(jobs []*strat.StratJob, subs []*strat.Dat
 	for key, jobs := range infos {
 		r.Strategies.SetInfoJobMap(r.defaultAccount, key, jobs)
 	}
-	biz.InitLocalOrderMgrWithRuntimeDeps(r.BizDeps(), nil, false)
+	biz.EnsureTimeSeriesOrderTask(r.BizDeps())
+	// Fill notifications (rpc_channels) for execution-backed robots; the callback
+	// only enqueues, see Runtime.OrderNotifyCallback.
+	biz.InitLocalOrderMgrWithRuntimeDeps(r.BizDeps(), r.OrderNotifyCallback(), false)
 	manager, ok := biz.GetOdMgrWithState(r.Trading, r.defaultAccount).(interface{ BindJobs([]*strat.StratJob) error })
 	if !ok {
 		return errors.New("runtime: legacy shared facade unavailable")
@@ -111,6 +114,7 @@ func (r *Runtime) BindFactorLegacyJobs(jobs []*strat.StratJob, subs []*strat.Dat
 	}
 	r.factorLegacyTrader = &trader
 	r.factorLegacySubs = append([]*strat.DataSub(nil), subs...)
+	r.bindLiveHooks(jobs)
 	return nil
 }
 
@@ -118,16 +122,20 @@ func (r *Runtime) feedFactorLegacy(series *orm.DataSeries) error {
 	if r.factorLegacyTrader == nil || series == nil {
 		return nil
 	}
-	matched := false
+	var matched *strat.DataSub
 	for _, sub := range r.factorLegacySubs {
 		if sub.Source == series.Source && sub.ExSymbol.ID == series.Sid && sub.TimeFrame == series.TimeFrame {
-			matched = true
+			matched = sub
 			break
 		}
 	}
-	if !matched {
+	if matched == nil {
 		return nil
 	}
+	// Dashboard feed and batch firing, as CryptoTrader.feedDataSeries does before
+	// handing the row to the trader; neither can fail or block the feed.
+	r.publishSeries(matched, series)
+	r.batchFeed(matched, series)
 	if !series.IsWarmUp {
 		manager := biz.GetOdMgrWithState(r.Trading, r.defaultAccount)
 		if err := manager.UpdateByDataSeries(nil, series); err != nil {

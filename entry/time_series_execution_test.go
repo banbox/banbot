@@ -86,8 +86,6 @@ func TestTimeSeriesExecutionBuildsExplicitAccountWithoutFactor(t *testing.T) {
 func TestTimeSeriesExecutionRejectsUnmigratedChoices(t *testing.T) {
 	for _, change := range []struct{ name, from, to, reason string }{
 		{"native", "protection_mode: software", "protection_mode: native", "protection_mode"},
-		{"fatal-stop", "env: prod", "env: prod\nfatal_stop: {'60': 0.1}", "fatal_stop"},
-		{"leverage", "env: prod", "env: prod\nleverage: 5", "leverage"},
 		{"spot", "market_type: linear", "market_type: spot", "linear"},
 		{"missing-unit", "pairs: ['BTC/USDT:USDT']", "pairs: ['ETH/USDT:USDT']", "explicit SID"},
 	} {
@@ -232,7 +230,6 @@ func TestFactorHubDryRunRejectsUnimplementedFundingBeforeIO(t *testing.T) {
 
 func TestMixedSharedAccountRejectsUnmigratedTSChoicesBeforeBinding(t *testing.T) {
 	for _, change := range []struct{ name, from, to, reason string }{
-		{"fatal-stop", "env: prod", "env: prod\nfatal_stop: {'60': 0.1}", "fatal_stop"},
 		{"root-leverage", "env: prod", "env: prod\nleverage: 5", "leverage"},
 		{"account-leverage", "accounts: {default: {}}", "accounts: {default: {leverage: 5}}", "leverage"},
 	} {
@@ -245,7 +242,9 @@ func TestMixedSharedAccountRejectsUnmigratedTSChoicesBeforeBinding(t *testing.T)
 			session := &explicitEntrySession{runSpec: spec}
 			// No snapshot, transport, or strategy factory is available: this guard
 			// must fail before those resources or a custom binding are touched.
-			_, prepareErr := session.prepareMixedLiveBinding(nil, runner.Config{AccountID: "default"}, &FactorLiveBinding{Legacy: &FactorLegacyLiveBinding{}})
+			// Declared leverage is applied by the Hub owner only: an embedded
+			// provider (one that brings its own transport) must still refuse it.
+			_, prepareErr := session.prepareMixedLiveBinding(nil, runner.Config{AccountID: "default"}, &FactorLiveBinding{Transport: execution.NewBanexgTransport(), Legacy: &FactorLegacyLiveBinding{}})
 			if prepareErr == nil || !strings.Contains(prepareErr.Error(), change.reason) {
 				t.Fatalf("unsafe mixed TS configuration reached binding: %v", prepareErr)
 			}
@@ -433,5 +432,51 @@ func TestTimeSeriesExecutionAccountValidatesRestoredBindingsBeforeRecovery(t *te
 				t.Fatal("invalid restored binding reached account bootstrap, reconciliation or startup")
 			}
 		})
+	}
+}
+
+// fatal_stop is served by the execution account loss circuit breaker, so the
+// entry must accept it instead of rejecting it as an unmigrated choice.
+func TestTimeSeriesExecutionAcceptsFatalStop(t *testing.T) {
+	body := strings.Replace(timeSeriesExecutionYAML(), "env: prod", "env: prod\nfatal_stop: {'60': 0.1}\nfatal_stop_hours: 4", 1)
+	spec, err := config.LoadRunSpec(&config.CmdArgs{NoDefault: true, DataDir: t.TempDir(), ConfigData: body}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := buildTimeSeriesLiveConfigs(spec); err != nil {
+		t.Fatalf("fatal_stop must be accepted: %v", err)
+	}
+}
+
+// Declared leverage is part of the Hub account registration, so the entry
+// accepts it and the robot declares it on every account instrument.
+func TestTimeSeriesExecutionDeclaresAccountLeverage(t *testing.T) {
+	body := strings.Replace(timeSeriesExecutionYAML(), "env: prod", "env: prod\nleverage: 5", 1)
+	spec, err := config.LoadRunSpec(&config.CmdArgs{NoDefault: true, DataDir: t.TempDir(), ConfigData: body}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := buildTimeSeriesLiveConfigs(spec); err != nil {
+		t.Fatalf("declared leverage must be accepted: %v", err)
+	}
+	body = strings.Replace(timeSeriesExecutionYAML(), "accounts: {default: {}}", "accounts: {default: {leverage: 5}}", 1)
+	if spec, err = config.LoadRunSpec(&config.CmdArgs{NoDefault: true, DataDir: t.TempDir(), ConfigData: body}, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := buildTimeSeriesLiveConfigs(spec); err != nil {
+		t.Fatalf("account-level declared leverage must be accepted: %v", err)
+	}
+	for _, tc := range []struct {
+		root, account float64
+		want          int
+		bad           bool
+	}{
+		{0, 0, 0, false}, {5, 0, 5, false}, {5, 3, 3, false}, {2.5, 0, 0, true}, {0, 200, 0, true}, {0.5, 0, 0, true},
+	} {
+		cfg := &config.Config{Leverage: tc.root, Accounts: map[string]*config.AccountConfig{"default": {Leverage: tc.account}}}
+		got, err := declaredAccountLeverage(cfg, "default")
+		if (err != nil) != tc.bad || got != tc.want {
+			t.Fatalf("root=%v account=%v: got %d err=%v", tc.root, tc.account, got, err)
+		}
 	}
 }

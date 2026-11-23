@@ -33,6 +33,7 @@ type LocalOrderMgr struct {
 
 type FnOdCb = func(od *ormo.InOutOrder, isEnter bool)
 
+// Deprecated: package-global facade; use InitLocalOrderMgrWithRuntimeDeps.
 func InitLocalOrderMgr(callBack FnOdCb, showLog bool, stops ...func()) {
 	InitLocalOrderMgrWithPriceState(callBack, showLog, nil, nil, stops...)
 }
@@ -539,14 +540,6 @@ func stopEntryTriggered(isBuy bool, trigger, low, high float64) bool {
 
 func stopEntryTriggeredWith(isBuy bool, trigger, low, high float64, legacyIntrabar bool) bool {
 	return (execution.OHLCProfile{LegacyIntrabar: legacyIntrabar}).StopEntryTriggered(isBuy, trigger, low, high)
-}
-
-func (o *LocalOrderMgr) simMarketPrice(bar *orm.SeriesOHLCV, rate float64) float64 {
-	return simMarketPriceWithLegacy(bar, rate, o.legacyIntrabarEnabled())
-}
-
-func (o *LocalOrderMgr) simMarketRate(bar *orm.SeriesOHLCV, price float64, isBuy, isTrigger bool, minRate float64) float64 {
-	return simMarketRateWithLegacy(bar, price, isBuy, isTrigger, minRate, o.legacyIntrabarEnabled())
 }
 
 func (o *LocalOrderMgr) cutSeriesFromRate(bar *orm.SeriesOHLCV, tfMSecs int64, rate float64) *orm.SeriesOHLCV {
@@ -1104,12 +1097,6 @@ func (o *LocalOrderMgr) cleanUpAt(atMS int64) *errs.Error {
 	return o.CleanUp()
 }
 
-// CloseBacktestOrdersAt closes positions that are still open at a historical
-// baseline before an extended backtest continues into its new tail.
-func CloseBacktestOrdersAt(account string, atMS int64) *errs.Error {
-	return closeBacktestOrdersAt(nil, account, atMS)
-}
-
 // CloseBacktestOrdersAtWithState closes typed-runtime positions at a
 // historical boundary without consulting the legacy order-manager registry.
 func CloseBacktestOrdersAtWithState(state *TradingState, account string, atMS int64) *errs.Error {
@@ -1312,12 +1299,12 @@ func getPendingSub(od *ormo.InOutOrder) *ormo.ExOrder {
 	return nil
 }
 
-func simPriceByRate(bar *orm.SeriesOHLCV, rate float64) (float64, float64, float64) {
-	return simPriceByRateWithLegacy(bar, rate, legacyIntrabarEnabled())
+func (o *LocalOrderMgr) simMarketPrice(bar *orm.SeriesOHLCV, rate float64) float64 {
+	return simMarketPriceWithLegacy(bar, rate, o.legacyIntrabarEnabled())
 }
 
-func simPriceByRateWithLegacy(bar *orm.SeriesOHLCV, rate float64, legacyIntrabar bool) (float64, float64, float64) {
-	return (execution.OHLCProfile{LegacyIntrabar: legacyIntrabar}).PriceRange(bar, rate)
+func (o *LocalOrderMgr) simMarketRate(bar *orm.SeriesOHLCV, price float64, isBuy, isTrigger bool, minRate float64) float64 {
+	return simMarketRateWithLegacy(bar, price, isBuy, isTrigger, minRate, o.legacyIntrabarEnabled())
 }
 
 func simMarketPrice(bar *orm.SeriesOHLCV, rate float64) float64 {

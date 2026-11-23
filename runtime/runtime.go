@@ -674,7 +674,18 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 		}
 		opts.ExtraMarkets = normalizedExtra
 	}
-	if opts.HubOrderBridge != nil {
+	if opts.HubOrderBridge != nil && opts.HubOrderBridge.LocalAccount {
+		// The only SharedExecution + HubOrderBridge composition: an embedded
+		// production robot whose Hub is an in-process port onto the very account
+		// this runtime borrows (biz.HubOrderMgr over execution.EmbeddedHub). Nothing else may differ.
+		bridge := opts.HubOrderBridge
+		if opts.SharedExecution == nil || opts.AccountOwnerKey == nil || *opts.AccountOwnerKey != bridge.Account || opts.SharedOrderBridge != nil || opts.LegacyExecution != nil || opts.HubMarketData || !opts.SharedMarketData || opts.Env != core.RunEnvProd || opts.Mode != core.RunModeLive {
+			return nil, fmt.Errorf("runtime: local-account Hub bridge requires one production runtime borrowing the bridged account")
+		}
+		if err := bridge.Validate(); err != nil {
+			return nil, err
+		}
+	} else if opts.HubOrderBridge != nil {
 		if opts.SharedExecution != nil || opts.SharedOrderBridge != nil || opts.LegacyExecution != nil || opts.AccountOwnerKey != nil || opts.SharedMarketData || (opts.Env != core.RunEnvProd && opts.Env != core.RunEnvDryRun) || opts.Mode != core.RunModeLive && opts.Mode != core.RunModeData {
 			return nil, fmt.Errorf("runtime: Hub bridge requires live/dry-run remote execution without local owner")
 		}
@@ -707,6 +718,11 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 	if opts.SharedOrderBridge != nil {
 		if opts.SharedExecution == nil {
 			return nil, fmt.Errorf("runtime: shared legacy bridge requires shared execution")
+		}
+		// biz.SharedOrderMgr is the backtest order manager. Live and dry-run
+		// accounts trade through biz.HubOrderMgr (HubOrderBridge).
+		if opts.Mode != core.RunModeBackTest {
+			return nil, fmt.Errorf("runtime: shared legacy bridge (SharedOrderMgr) is backtest-only; live accounts use a Hub order bridge")
 		}
 		if err := opts.SharedOrderBridge.Validate(); err != nil {
 			return nil, err
@@ -951,8 +967,12 @@ func (p *Process) NewRuntime(opts Options) (*Runtime, error) {
 			}
 			runtime.OnClose(runtime.sharedExecution.Release)
 			runtime.sharedMarketData = opts.SharedMarketData
-			runtime.sharedOrderBridge = opts.SharedOrderBridge
-			if bridge := opts.SharedOrderBridge; bridge != nil {
+			// A local-account Hub bridge keeps the bridge copy installed above (jobs,
+			// risk policy and quotes below use it); no SharedOrderBridge exists then.
+			if opts.HubOrderBridge == nil || !opts.HubOrderBridge.LocalAccount {
+				runtime.sharedOrderBridge = opts.SharedOrderBridge
+			}
+			if bridge := runtime.sharedOrderBridge; bridge != nil {
 				risk := bridge.Risk
 				risk.StrategyGrossLimits = maps.Clone(bridge.Risk.StrategyGrossLimits)
 				known := map[execution.StrategyID]bool{}

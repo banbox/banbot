@@ -212,7 +212,7 @@ func (e *OwnerExecutor) prepareRebalance(request CombinedRebalance, checkpoints 
 				}
 				for _, leg := range coordination.Legs {
 					if leg.Steps < r.Instrument.MinSteps || r.Instrument.Notional(leg.Steps, price).LessThan(r.Instrument.MinNotional) {
-						return errors.New("execution: coordinated real delta below venue minimum")
+						return &venueMinimumError{Instrument: r.Instrument.ID}
 					}
 				}
 				p := pending{request: r, coordination: coordination, observation: observation}
@@ -391,13 +391,13 @@ func (e *OwnerExecutor) prepareRebalance(request CombinedRebalance, checkpoints 
 					return errors.New("execution: missing combined strategy gross limit")
 				}
 				if amount.GreaterThan(previousGross[strategy]) && amount.GreaterThan(limit) || strategyCollateral[strategy].GreaterThan(previousCollateral[strategy]) && strategyCollateral[strategy].GreaterThan(nav[strategy]) {
-					return errors.New("execution: combined strategy gross/NAV budget exceeded")
+					return rejectedAt(RejectRiskLimit, "execution: combined strategy gross/NAV budget exceeded", rejectionScope{Strategy: strategy})
 				}
 				gross = gross.Add(amount)
 				oldTotalGross = oldTotalGross.Add(previousGross[strategy])
 			}
 			if desiredMargin.GreaterThan(currentMargin) && (desiredMargin.GreaterThan(request.Risk.MaxAccountMargin) || desiredMargin.GreaterThan(equity)) || gross.GreaterThan(oldTotalGross) && gross.GreaterThan(request.Risk.MaxVirtualGross) {
-				return errors.New("execution: combined account budget exceeded")
+				return rejected(RejectRiskLimit, "execution: combined account budget exceeded")
 			}
 			if err := e.Store.SavePlan(ctx, plan); err != nil {
 				return err
@@ -424,8 +424,13 @@ func (e *OwnerExecutor) prepareRebalance(request CombinedRebalance, checkpoints 
 						if steps == 0 {
 							continue
 						}
-						if buy.Strategy == sell.Strategy {
-							return errors.New("execution: self-cross requires target consolidation")
+						// A strategy closing its own long and short lots of one
+						// instrument crosses them internally: both lots close at
+						// the same price with no exposure change and no venue
+						// order. Any other same-strategy opposition (opening both
+						// directions, or flipping) still needs target consolidation.
+						if buy.Strategy == sell.Strategy && !(buy.Kind == ExitIntent && sell.Kind == ExitIntent) {
+							return rejectedAt(RejectSelfCross, "execution: self-cross requires target consolidation", rejectionScope{Strategy: buy.Strategy, Instrument: p.request.Instrument.ID})
 						}
 						if buy.Conditions.PostOnly || sell.Conditions.PostOnly {
 							return errors.New("execution: post-only contributor cannot be internally crossed")
@@ -461,7 +466,7 @@ func (e *OwnerExecutor) prepareRebalance(request CombinedRebalance, checkpoints 
 						if limit.IsPositive() {
 							_, remainder := limit.QuoRem(p.request.Instrument.PriceTick, 0)
 							if !remainder.IsZero() {
-								return errors.New("execution: contributor limit violates instrument tick")
+								return rejectedAt(RejectLimitOffTick, "execution: contributor limit violates instrument tick", rejectionScope{Strategy: intent.Strategy, Lot: intent.Lot, Instrument: p.request.Instrument.ID, Kind: intent.Kind})
 							}
 							if order.Limit.IsZero() || leg.Side == Buy && limit.LessThan(order.Limit) || leg.Side == Sell && limit.GreaterThan(order.Limit) {
 								order.Limit = limit
@@ -502,3 +507,10 @@ func (e *OwnerExecutor) prepareRebalance(request CombinedRebalance, checkpoints 
 	})
 	return result, err
 }
+
+// ErrVenueMinimum rejects a plan whose real order would be smaller than the
+// venue accepts. It is raised while the plan is prepared, before anything is
+// committed, so the rejected command left no trace in the account. It is the
+// one rejection a Hub reports to its client as such: a robot that retried the
+// same frozen command would be refused forever.
+var ErrVenueMinimum = errors.New("execution: coordinated real delta below venue minimum")

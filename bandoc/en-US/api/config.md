@@ -91,7 +91,7 @@ func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
 | `GetDataDir()` / `GetDataDirSafe()` | Legacy global directory access; the former panics when absent (asking for `BanDataDir` or `-datadir`), the latter may return an empty string |
 | `ResolveDataDir(explicit)` / `GetStratDir()` | Explicit data directory precedes `BanDataDir`; strategy directory comes from `BanStratDir` |
 | `ParsePath(path)` | Legacy data-directory prefix resolution; new fields use `RunSpec.ResolvePath` |
-| `GetTakeOverTF(pair, defTF)` / `GetAccLeverage(account)` / `GetStakeAmount(account)` | Compatibility lookups depending on legacy state |
+| `GetAccLeverage(account)` / `GetStakeAmount(account)` | Compatibility lookups depending on legacy state |
 | `DumpYaml(desensitize bool)` / `(*Config).DumpYaml()` | Export legacy configuration; the package function requires a redaction argument |
 | `ParseTimeRange(raw)` | Return start/end milliseconds and an error |
 | `GetExportConfig(path)` / `LoadPerfs(inDir)` | Export configuration / legacy performance loading |

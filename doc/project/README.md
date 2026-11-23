@@ -39,7 +39,7 @@ banbot 是一个 Go 编写的量化交易系统，覆盖：策略配置、交易
 | `orm/ data/` | DataSeries 模型、QuestDB/PG 读写与表替换、历史补齐、回放 feeder、实盘采集、逐笔归档 | [02_data_storage.md](02_data_storage.md) |
 | `exg/ goods/` | banexg 适配层与可选能力接口；品种筛选过滤器流水线；国内市场（仅文档） | [03_exchange_goods.md](03_exchange_goods.md) |
 | `strat/ runtime/ runtimeplan/` | 策略接口、StratJob、信号意图、Job 加载/轮换、Process→Runtime 所有权、数据计划编译 | [04_strategy_runtime.md](04_strategy_runtime.md) |
-| `biz/ live/` | Trader、各类订单管理器（本地/实盘/共享/Hub）、钱包、检查点与接管、远程命令、实盘主控制器 | [05_biz_orders_live.md](05_biz_orders_live.md) |
+| `biz/ live/` | Trader、各类订单管理器（本地/共享/Hub）、钱包、检查点与接管、远程命令、live 外壳与支持矩阵 | [05_biz_orders_live.md](05_biz_orders_live.md) |
 | `execution/` | 账户级执行：单写入者 AccountOwner、VirtualLot/Plan/StoredOrder、账本、Hub RPC、恢复与对账 | [06_execution.md](06_execution.md) |
 | `factor/` | 因子 DAG 与表达式、Session/Batch、组合与生命周期策略、版本存储、统计套利、研究与回测 | [07_factor_engine.md](07_factor_engine.md) |
 | `kb/` | 策略知识库（ts/factor/statarb 中英文 Markdown），`kb.GetKB(lang, names...)` 读取嵌入内容 | [../README.md](../README.md)「AI 知识库」 |
@@ -59,7 +59,7 @@ banbot 是一个 Go 编写的量化交易系统，覆盖：策略配置、交易
 2. 按 `run_policy.engine` 分派：时序 → `goods` 选品 + `strat` 生成 Job；因子 → `factor/runner` 构建定义、Universe、决策计划。
 3. `data` 把行情或第三方数据统一转成 `orm.DataSeries`（回测由 `HistProvider`+feeder 回放，实盘由 `LiveProvider`+`LiveSpider`）。
 4. 时序：`biz.Trader` 分发到 Job，策略产生 `EnterReq/ExitReq`（只入队不下单），经回调交给订单管理器。因子：快照冻结当轮可见数据 → Session 计算 → 组合/policy 生成目标。
-5. 订单：回测用本地 odmgr；实盘用 `LiveOrderMgr`；共享账户/因子/混合走 `execution.SharedAccount`（先落库、后发送的状态机）；Hub 模式经本机 Unix socket RPC。
+5. 订单：回测用本地 odmgr；实盘与 dry_run 一律走 `execution`（`HubOrderMgr` / 共享账户 `execution.SharedAccount`，先落库、后发送的状态机），Hub 模式经本机 Unix socket RPC；旧的 `LiveOrderMgr` 已删除，仅旧栈支持的能力见 [05](05_biz_orders_live.md)「支持矩阵」。
 6. `orm` 持久化 K 线、时序、订单、任务；`web`/`rpc`/`live` 提供监控、控制与通知。
 
 ## 5. 关键约定与易踩坑

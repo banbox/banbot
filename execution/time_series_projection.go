@@ -19,6 +19,9 @@ type TimeSeriesProjectionRequest struct {
 	Name  string
 	Limit int
 	Lots  []TimeSeriesLotKey
+	// Takeovers lists the strategies whose adopted external positions the
+	// caller renders. Empty (the default) returns none.
+	Takeovers []StrategyID `json:",omitempty"`
 }
 
 type TimeSeriesProjectionRecord struct {
@@ -36,6 +39,9 @@ type TimeSeriesProjectionPage struct {
 	Records    []TimeSeriesProjectionRecord
 	Events     []CommittedEvent
 	Reconciled bool
+	// Takeovers are the automatic-takeover records of the requested
+	// strategies. Additive: empty unless the request asked for them.
+	Takeovers []AutoTakeoverRecord `json:",omitempty"`
 }
 
 // TimeSeriesProjectionPort is the robot-facing seam. Implementations never
@@ -47,7 +53,7 @@ type TimeSeriesProjectionPort interface {
 
 func (b *SharedAccountBorrow) TimeSeriesProjection(ctx context.Context, request TimeSeriesProjectionRequest) (TimeSeriesProjectionPage, error) {
 	var page TimeSeriesProjectionPage
-	if !canonicalID(request.Name) || request.Limit < 1 || request.Limit > 10000 || len(request.Lots) > 10000 {
+	if !canonicalID(request.Name) || request.Limit < 1 || request.Limit > 10000 || len(request.Lots) > 10000 || len(request.Takeovers) > 64 {
 		return page, errors.New("execution: invalid time-series projection request")
 	}
 	err := b.use(func(s *SharedAccount) error {
@@ -135,7 +141,8 @@ func (b *SharedAccountBorrow) TimeSeriesProjection(ctx context.Context, request 
 				}
 				page.Records = append(page.Records, record)
 			}
-			return nil
+			page.Takeovers, err = takeoverRecordsFor(scope, s.store, request.Takeovers)
+			return err
 		})
 	})
 	return page, err

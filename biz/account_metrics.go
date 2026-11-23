@@ -42,6 +42,9 @@ func readRuntimeAccountMetrics(deps RuntimeDeps, account string) strat.AccountMe
 	if deps.HubOrderBridge != nil {
 		return readHubAccountMetrics(deps)
 	}
+	if reader := lookupHubAccountReader(deps); reader != nil {
+		return reader.read(deps)
+	}
 	if deps.Trading == nil {
 		return strat.AccountMetrics{}
 	}
@@ -291,37 +294,20 @@ func readSharedAccountMetrics(deps RuntimeDeps) strat.AccountMetrics {
 	var bridge *SharedOrderBridgeConfig
 	if deps.SharedOrderBridge != nil {
 		bridge = deps.SharedOrderBridge
+	} else if deps.HubOrderBridge != nil && deps.HubOrderBridge.LocalAccount {
+		// HubOrderMgr on an embedded account: same ledger, read once here
+		// (never through the port as well), with the bridge's instruments/marks.
+		bridge = &deps.HubOrderBridge.Bridge
 	}
 	return snapshotToAccountMetrics(deps, snapshot, marks, bridge)
 }
 
 func readHubAccountMetrics(deps RuntimeDeps) strat.AccountMetrics {
-	cfg := deps.HubOrderBridge
-	if cfg == nil || cfg.Client == nil {
+	reader := hubTSAccountReader(deps)
+	if reader == nil {
 		return strat.AccountMetrics{}
 	}
-	ctx := context.Background()
-	if deps.Core != nil && deps.Core.Context() != nil {
-		ctx = deps.Core.Context()
-	}
-	snapshot, err := cfg.Client.Snapshot(ctx, cfg.Account)
-	if err != nil {
-		return strat.AccountMetrics{}
-	}
-	marks := make(map[string]decimal.Decimal)
-	for _, pos := range snapshot.ActualPositions {
-		if pos.SignedSteps == 0 {
-			continue
-		}
-		if _, exists := marks[pos.Instrument.ID]; exists {
-			continue
-		}
-		if q, qErr := cfg.Client.VisibleQuote(ctx, cfg.Account, pos.Instrument.ID); qErr == nil &&
-			q.Bid.IsPositive() && q.Ask.GreaterThanOrEqual(q.Bid) {
-			marks[pos.Instrument.ID] = q.Bid.Add(q.Ask).Div(decimal.NewFromInt(2))
-		}
-	}
-	return snapshotToAccountMetrics(deps, snapshot, marks, &cfg.Bridge)
+	return reader.read(deps)
 }
 
 func snapshotToAccountMetrics(deps RuntimeDeps, snapshot execution.AccountSnapshot, marks map[string]decimal.Decimal, bridge *SharedOrderBridgeConfig) strat.AccountMetrics {
@@ -468,7 +454,7 @@ func (t *Trader) observeAccountsEquity(odMatch bool, accOrders map[string][]*orm
 			continue
 		}
 		if t.runtime != nil {
-			if t.runtime.SharedExecution != nil || t.runtime.HubOrderBridge != nil {
+			if t.runtime.SharedExecution != nil || t.runtime.HubOrderBridge != nil || lookupHubAccountReader(*t.runtime) != nil {
 				if state := t.strategyState(); state != nil {
 					accName := t.accountName(account)
 					if m := readRuntimeAccountMetrics(*t.runtime, accName); m.Valid && m.Equity > 0 {
@@ -528,4 +514,25 @@ func (t *Trader) observeAccountsEquity(odMatch bool, accOrders map[string][]*orm
 			strat.ObserveLegacyAccountEquity(accName, m.Equity)
 		}
 	}
+}
+
+// ExecutionAccountBalance reports the balance of a runtime whose orders are
+// owned by an execution account. backed is false for the wallet-based paths.
+// remote is true when the account lives behind a Hub: such a robot holds no
+// account credentials, so private exchange queries are not available to it.
+// The balance is the ledger's settled cash plus marked positions (Equity) and
+// what remains after margin (Available), in the account settlement currency.
+func ExecutionAccountBalance(deps RuntimeDeps, account string) (currency string, metrics strat.AccountMetrics, backed, remote bool) {
+	switch {
+	case deps.SharedExecution != nil:
+		currency = deps.SharedExecution.AccountKey().SettlementDomain
+	case deps.HubOrderBridge != nil:
+		currency, remote = deps.HubOrderBridge.Account.SettlementDomain, true
+	case lookupHubAccountReader(deps) != nil:
+		// Factor-only Hub robot: read-only ledger binding, cached short-term.
+		currency, remote = lookupHubAccountReader(deps).Currency(), true
+	default:
+		return "", strat.AccountMetrics{}, false, false
+	}
+	return currency, readRuntimeAccountMetrics(deps, account), true, remote
 }

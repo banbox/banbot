@@ -1,6 +1,7 @@
 package live
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/banbox/banbot/biz"
@@ -64,53 +65,21 @@ func TestCloseOrdersWithRuntimeDepsRequiresConfirmationBeforeExchangeCalls(t *te
 	}
 }
 
-func TestCloseOrdersWithRuntimeDepsScopesExchangeCallsToSelectedAccount(t *testing.T) {
-	exchange := &closeToolExchange{
-		orders:    []*banexg.Order{{ID: "open", Symbol: "BTC/USDT", Status: "open"}},
-		positions: []*banexg.Position{{Symbol: "BTC/USDT", Side: banexg.PosSideLong, Contracts: 1}},
-	}
-	result, err := CloseOrdersWithRuntimeDeps(closeToolDeps(exchange), TradeCloseRequest{
-		Accounts: []string{"a"}, Exchange: true, Confirmed: true,
-	})
-	if err != nil || result.Closed != 1 {
-		t.Fatalf("close result = %+v, %v", result, err)
-	}
-	for _, calls := range [][]string{exchange.openCalls, exchange.positionCalls, exchange.cancelCalls, exchange.createCalls} {
-		for _, call := range calls {
-			if call[0] != 'a' {
-				t.Fatalf("unselected account received exchange call: %q", call)
+// Without a bound execution account (embedded or Hub) closing is refused in
+// every env and never reaches the venue.
+func TestCloseRequiresExecutionOwner(t *testing.T) {
+	for _, envReal := range []bool{false, true} {
+		for _, raw := range []bool{false, true} {
+			exchange := &closeToolExchange{}
+			deps := closeToolDeps(exchange)
+			deps.Core.EnvReal = envReal
+			_, err := CloseOrdersWithRuntimeDeps(deps, TradeCloseRequest{Accounts: []string{"a"}, Exchange: raw, Confirmed: true})
+			if err == nil || !strings.Contains(err.Error(), "execution account") {
+				t.Fatalf("close without an execution owner = %v, want refusal", err)
 			}
-		}
-	}
-}
-
-func TestCloseOrdersWithRuntimeDepsHonorsPairFilter(t *testing.T) {
-	exchange := &closeToolExchange{
-		orders:    []*banexg.Order{{ID: "open", Symbol: "ETH/USDT", Status: "open"}},
-		positions: []*banexg.Position{{Symbol: "ETH/USDT", Side: banexg.PosSideLong, Contracts: 1}},
-	}
-	result, err := CloseOrdersWithRuntimeDeps(closeToolDeps(exchange), TradeCloseRequest{
-		Accounts: []string{"a"}, Pairs: []string{"BTC/USDT"}, Exchange: true, Confirmed: true,
-	})
-	if err != nil || result.Closed != 0 {
-		t.Fatalf("filtered close result = %+v, %v", result, err)
-	}
-	if len(exchange.cancelCalls) != 0 || len(exchange.createCalls) != 0 {
-		t.Fatalf("unmatched pair triggered mutations: cancel=%v create=%v", exchange.cancelCalls, exchange.createCalls)
-	}
-}
-
-func TestProductionCloseCannotBypassExecutionOwner(t *testing.T) {
-	for _, raw := range []bool{false, true} {
-		exchange := &closeToolExchange{}
-		deps := closeToolDeps(exchange)
-		deps.Core.EnvReal = true
-		_, err := CloseOrdersWithRuntimeDeps(deps, TradeCloseRequest{Accounts: []string{"a"}, Exchange: raw, Confirmed: true})
-		if err == nil {
-			t.Fatal("retired production close path accepted without an execution owner")
-		}
-		if len(exchange.openCalls)+len(exchange.positionCalls)+len(exchange.cancelCalls)+len(exchange.createCalls) != 0 {
-			t.Fatal("rejected production close accessed the venue", exchange)
+			if len(exchange.openCalls)+len(exchange.positionCalls)+len(exchange.cancelCalls)+len(exchange.createCalls) != 0 {
+				t.Fatal("rejected close accessed the venue", exchange)
+			}
 		}
 	}
 }

@@ -224,7 +224,7 @@ func TestRegisteredFactorLiveRestoresLegacyOutsideUniverse(t *testing.T) {
 		t.Fatal(err)
 	}
 	biz.InitLocalOrderMgrWithRuntimeDeps(rt.BizDeps(), nil, false)
-	job := &strat.StratJob{Strat: &strat.TradeStrat{Name: "legacy"}, Symbol: symbol, TimeFrame: "event", Account: "default", ExgStopLoss: true, CloseLong: true, CloseShort: true}
+	job := &strat.StratJob{Strat: &strat.TradeStrat{Name: "legacy"}, Symbol: symbol, TimeFrame: "1m", Account: "default", ExgStopLoss: true, CloseLong: true, CloseShort: true}
 	job.BindRuntimeState(rt.Strategies, rt.Core, rt.Clock)
 	job.BindRuntimeMarket(rt.Market.Prices, rt.Clock)
 	rt.Market.Prices.SetBarPriceAt(rt.Clock.TimeMS(), basis.ID, 100)
@@ -309,9 +309,7 @@ func TestRegisteredFactorLiveRestoresLegacyOutsideUniverse(t *testing.T) {
 		warmupCallbacks := 0
 		exitCommitted := make(chan struct{}, 1)
 		completed := false
-		feedExpired := false
-		var waitingStatus int64
-		liveJob := &strat.StratJob{Strat: &strat.TradeStrat{Name: "legacy"}, Symbol: symbol, TimeFrame: "event", Account: "default", ExgStopLoss: true, CloseLong: true, CloseShort: true}
+		liveJob := &strat.StratJob{Strat: &strat.TradeStrat{Name: "legacy"}, Symbol: symbol, TimeFrame: "1m", Account: "default", ExgStopLoss: true, CloseLong: true, CloseShort: true}
 		liveJob.Strat.OnData = func(s *strat.StratJob, event strat.DataEvent) {
 			if s.IsWarmUp {
 				warmupCallbacks++
@@ -334,11 +332,8 @@ func TestRegisteredFactorLiveRestoresLegacyOutsideUniverse(t *testing.T) {
 			if !ok || held == nil || held.Enter.Filled != 1 || held.GetStopLoss() == nil || held.GetStopLoss().Price != 95 {
 				callbackErr = fmt.Errorf("restored TS facade/protection: %v %v", ok, orders)
 			}
-			if waiting != nil {
-				waitingStatus = waiting.Status
-			}
-			if waiting != nil && waiting.Status >= ormo.InOutStatusFullExit {
-				feedExpired = true
+			if waiting == nil && callbackErr == nil {
+				callbackErr = errors.New("legacy resting entry was not imported into the Hub journal")
 			}
 			if event.Raw("nullable") != nil {
 				callbackErr = errors.New("NULL field changed")
@@ -382,7 +377,6 @@ func TestRegisteredFactorLiveRestoresLegacyOutsideUniverse(t *testing.T) {
 					return sink.Emit(bySID[sid], []*orm.DataRecord{{Sid: sid, TimeMS: stamp, EndMS: stamp, Closed: closed, Values: map[string]any{"close": 100.0, "integer": int64(sid), "nullable": nil}}})
 				}
 				if mutation == "blocked quote" {
-					transport.block.Store(true)
 					go func() {
 						select {
 						case <-transport.entered:
@@ -390,9 +384,32 @@ func TestRegisteredFactorLiveRestoresLegacyOutsideUniverse(t *testing.T) {
 						case <-ctx.Done():
 						}
 					}()
-					// Cancel the entry while an admitted source callback waits in
-					// verified quote IO. Only production startup cleanup stops it.
-					err := emit(1, grid, false)
+					// Cancel the entry while an admitted source callback of the factor
+					// part waits in verified quote IO. Only production startup cleanup
+					// stops it. (The TS part no longer fetches quotes per feed bar: its
+					// Hub order manager only reads them for commands and pending ticks.)
+					for _, sid := range []int32{2, 3} {
+						if err := emit(sid, grid, true); err != nil {
+							return err
+						}
+					}
+					select {
+					case <-time.After(time.Duration(current.LatencyMS+1) * time.Millisecond):
+					case <-sourceCtx.Done():
+						return sourceCtx.Err()
+					}
+					transport.block.Store(true)
+					err := emit(2, time.Now().UnixMilli()-1, false)
+					if err == nil {
+						// The blocked call may be a sibling IO of the same account
+						// worker; either way the entry is canceled while it blocks.
+						select {
+						case <-sourceCtx.Done():
+							err = sourceCtx.Err()
+						case <-time.After(3 * time.Second):
+							return errors.New("no transport IO reached the blocked quote path")
+						}
+					}
 					if !errors.Is(err, context.Canceled) {
 						return fmt.Errorf("blocked callback result: %w", err)
 					}
@@ -404,23 +421,6 @@ func TestRegisteredFactorLiveRestoresLegacyOutsideUniverse(t *testing.T) {
 				}
 				if callbackErr != nil {
 					return callbackErr
-				}
-				if mutation == "feed expiry" {
-					if feedExpired {
-						return errors.New("pending StopBars expired before primary feed advanced")
-					}
-					if err := emit(1, grid+1, true); err != nil {
-						return err
-					}
-					if feedExpired {
-						return errors.New("pending StopBars expired after only one bar")
-					}
-					if err := emit(1, grid+2, true); err != nil {
-						return err
-					}
-					if !feedExpired {
-						return fmt.Errorf("actual entry SDK Bar0 did not expire StopBars: pending status=%d callbacks=%d", waitingStatus, callbacks)
-					}
 				}
 				for _, sid := range []int32{2, 3} {
 					if err := emit(sid, grid, true); err != nil {
@@ -453,21 +453,30 @@ func TestRegisteredFactorLiveRestoresLegacyOutsideUniverse(t *testing.T) {
 					exchange.mu.Lock()
 					exchange.prices[basis.ID] = 94
 					exchange.mu.Unlock()
-					// Software protection runs in feedFactorLegacy before OnData.
 					liveJob.Strat.OnData = func(*strat.StratJob, strat.DataEvent) { callbacks++ }
 					if err := emit(1, time.Now().UnixMilli()-1, false); err != nil {
 						return err
 					}
-					exchange.mu.Lock()
-					remaining := exchange.positions[basis.ID]
-					csPreserved := exchange.positions["ETH/USD"] != 0 && exchange.positions["ETH-PERP/USD"] != 0
+					// The Hub order manager's pending execution (a 1s ticker on the
+					// account's fresh quotes) fires the restored stop-loss.
+					var remaining float64
+					var csPreserved bool
 					var report *banexg.MyTrade
-					for _, od := range exchange.orders {
-						if od.Symbol == basis.ID && od.Side == banexg.OdSideSell {
-							report = &banexg.MyTrade{Trade: banexg.Trade{Order: od.ID}, ClientID: od.ClientOrderID}
+					for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+						exchange.mu.Lock()
+						remaining = exchange.positions[basis.ID]
+						csPreserved = exchange.positions["ETH/USD"] != 0 && exchange.positions["ETH-PERP/USD"] != 0
+						report = nil
+						for _, od := range exchange.orders {
+							if od.Symbol == basis.ID && od.Side == banexg.OdSideSell {
+								report = &banexg.MyTrade{Trade: banexg.Trade{Order: od.ID}, ClientID: od.ClientOrderID}
+							}
+						}
+						exchange.mu.Unlock()
+						if remaining == 0 && report != nil || time.Now().After(deadline) {
+							break
 						}
 					}
-					exchange.mu.Unlock()
 					if remaining != 0 || report == nil || !csPreserved {
 						return fmt.Errorf("restored software stop: btc=%v report=%v cs=%v", remaining, report, csPreserved)
 					}
@@ -516,7 +525,7 @@ func TestRegisteredFactorLiveRestoresLegacyOutsideUniverse(t *testing.T) {
 				_, _ = io.Copy(io.Discard, conn)
 			}
 		}()
-		cfg := &config.Config{Exchange: &config.ExchangeConfig{Name: "entrytest"}, MarketType: "linear", SpiderAddr: listener.Addr().String()}
+		cfg := &config.Config{Exchange: &config.ExchangeConfig{Name: "entrytest"}, MarketType: "linear", Env: core.RunEnvProd, Accounts: map[string]*config.AccountConfig{"default": {}}, SpiderAddr: listener.Addr().String()}
 		snapshot := config.NewSnapshotWithDirs(cfg, dir, "", nil)
 		bound, err := factory(ctx, exchange, snapshot, current)
 		if err != nil {
@@ -526,7 +535,7 @@ func TestRegisteredFactorLiveRestoresLegacyOutsideUniverse(t *testing.T) {
 		session := &explicitEntrySession{process: runtime.NewProcess(), ctx: sessionCtx, cancel: sessionCancel, exchange: exchange}
 		err = session.runFactorLive(ctx, snapshot, current, bound, &output)
 		session.close()
-		if mutation != "" && mutation != "blocked quote" && mutation != "blocked setup" && mutation != "feed expiry" {
+		if mutation != "" && mutation != "blocked quote" && mutation != "blocked setup" {
 			expected := map[string]string{"missing mapping": "explicit account SDK mapping", "mismatched mapping": "descriptor mismatch", "missing TS": "no configured live job", "mismatched TS": "strategy is undeclared"}[mutation]
 			if err == nil || !strings.Contains(err.Error(), expected) {
 				t.Fatalf("invalid binding was admitted: %v", err)
@@ -562,6 +571,15 @@ func TestRegisteredFactorLiveRestoresLegacyOutsideUniverse(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("provider socket not joined")
 		}
+		// The seeded SharedOrderMgr checkpoint of this mixed (factor + TS) account
+		// was imported once into the TS Hub journal.
+		journals, globErr := filepath.Glob(filepath.Join(dir, "execution", "robots", "ts-local-*.json"))
+		if globErr != nil || len(journals) != 1 {
+			t.Fatalf("expected one TS Hub journal: %v %v", journals, globErr)
+		}
+		if body, readErr := os.ReadFile(journals[0]); readErr != nil || !bytes.Contains(body, []byte(`"Migrated"`)) {
+			t.Fatalf("legacy checkpoint import did not run for the mixed account: %v", readErr)
+		}
 	}
 	for _, mutation := range []string{"missing mapping", "mismatched mapping", "missing TS", "mismatched TS"} {
 		t.Run(strings.ReplaceAll(mutation, " ", "_"), func(t *testing.T) { launch(t, mutation, false) })
@@ -569,6 +587,5 @@ func TestRegisteredFactorLiveRestoresLegacyOutsideUniverse(t *testing.T) {
 	t.Run("blocked_quote_callback_joins_on_cancel", func(t *testing.T) { launch(t, "blocked quote", false) })
 	t.Run("blocked_private_setup_joins_on_request_cancel", func(t *testing.T) { launch(t, "blocked setup", false) })
 	t.Run("restored_TS_and_CS", func(t *testing.T) { launch(t, "", false) })
-	t.Run("actual_primary_feed_expires_SDK_zero_bar", func(t *testing.T) { launch(t, "feed expiry", false) })
 	t.Run("repeat_startup_and_software_exit", func(t *testing.T) { launch(t, "", true) })
 }

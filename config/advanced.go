@@ -81,6 +81,8 @@ func validateAdvanced(path string, fields map[string]any) error {
 			if value != "local" && value != "exchange_first" {
 				return fmt.Errorf("%s must be local or exchange_first", field)
 			}
+		case "ts_facade":
+			return fmt.Errorf("%s was removed: the shared order facade no longer exists and the embedded production time-series robot always uses the Hub order manager; delete this key", field)
 		case "protection_mode":
 			if value != "software" && value != "native_preferred" {
 				return fmt.Errorf("%s must be software or native_preferred", field)

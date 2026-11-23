@@ -559,10 +559,10 @@ OnOrderChange: func(s *strat.StratJob, od *ormo.InOutOrder, chgType int) {
 
 **交易所侧挂单**：
 - 回测、`dry_run`：本地模拟触发，不访问交易所。
-- 实盘（`prod`）：订单**完全入场后**（`InOutStatusFullEnter`，部分成交期间不挂）为止损、止盈各单独调用 `CreateOrder` 挂条件单：止损 `stop_loss`（有 Limit 为 `stop_loss_limit`），止盈 `take_profit_market`（有 Limit 为 `take_profit_limit`），数量=当前持仓×Rate（0<Rate<1 时）；不用 ClosePosition（避免多订单互相覆盖），双向持仓靠 positionSide。追踪止损（`CallbackPct`）挂 `trailing_stop_market`（callbackRate、可选 activationPrice）；若 `CallbackPct` 超出交易所原生上限或被拒单，自动降级为 `LiveOrderMgr` 本地价格监控追踪止损，不会使订单失败；框架 tag 为 `trailing_stop` 的止损不另挂止损单。
+- 实盘（`prod`）与实时模拟（`dry_run`）：由 execution 路径处理保护单，`execution.protection_mode: software`（默认）由引擎按价格监控触发，`native_preferred` 在适配器支持时优先挂交易所条件单（有效模式见订单 `Info["execution_protection"]`）；追踪止损（`CallbackPct`/`ActivationPrice`）目前由引擎监控。旧 `LiveOrderMgr` 的逐单 `CreateOrder` 挂条件单与本地降级流程已删除。
 - banexg 适配：币安（现货/杠杆 STOP_LOSS(_LIMIT)/TAKE_PROFIT(_LIMIT)；合约 STOP_MARKET/STOP/TAKE_PROFIT_MARKET/TAKE_PROFIT/TRAILING_STOP_MARKET）、OKX（algo）、Bybit（conditional）均实现；不支持的品类/类型下单报错。
-- 失败：报"会立即触发"→立即市价平仓；其它失败只记 ERROR，更新失败不撤旧单，**无自动重试**，仅同步/重启时补挂缺失触发单。`SetAll*`/`od.SetStopLoss` 修改后实盘重编辑/重挂条件单。
-- `ExgStopLoss/ExgTakeProfit=false` 仅跳过实盘远端交易所条件单预挂，回测与实盘本地价格监控依然生效（见 §3.3）。
+- 失败与重试：由 execution 的待发命令与恢复流程处理（见 `06_execution.md`），不再有旧栈“仅同步/重启补挂”的行为。`SetAll*`/`od.SetStopLoss` 修改经改单命令发送。
+- `ExgStopLoss/ExgTakeProfit=false` 只影响回测本地监控语义；execution 路径的挂单方式由 `execution.protection_mode` 决定（见实盘指南）。
 - 回撤平仓（`DrawDownExit=true`）：框架跟踪最大浮盈比例 maxChg；r 取 `GetDrawDownExitRate`（`>0` 采用、`0` 不设置、`<0`/未设用默认表）：maxChg >10%→r=0.15，>4%→0.17，>2.5%→0.25，>1.5%→0.37，>0.7%→0.5，否则不启用。回撤价=入场价×(1+maxChg×(1−r)×方向)，当前收盘越过则 tag `draw_down` 市价平仓，否则**用该价覆盖订单的止损触发器**（会替换你设置的止损，实盘同步到交易所）。仅在 `OnCheckExit` 返回 nil 时检查。
 
 ### 4.3 多空限制

@@ -91,7 +91,7 @@ func Demo(pol *config.RunPolicyConfig) *strat.TradeStrat {
 | `GetDataDir()` / `GetDataDirSafe()` | 旧全局数据目录访问；前者无目录时 panic（提示需 `BanDataDir` 或 `-datadir`），后者允许返回空字符串 |
 | `ResolveDataDir(explicit)` / `GetStratDir()` | 前者显式值优先于 `BanDataDir`，后者读取 `BanStratDir` |
 | `ParsePath(path)` | 旧数据目录前缀路径解析；新字段使用 `RunSpec.ResolvePath` |
-| `GetTakeOverTF(pair, defTF)` / `GetAccLeverage(account)` / `GetStakeAmount(account)` | 依赖旧配置状态的兼容查询 |
+| `GetAccLeverage(account)` / `GetStakeAmount(account)` | 依赖旧配置状态的兼容查询 |
 | `DumpYaml(desensitize bool)` / `(*Config).DumpYaml()` | 导出旧配置，注意包级函数需传脱敏参数 |
 | `ParseTimeRange(raw)` | 返回起止毫秒时间戳和 error |
 | `GetExportConfig(path)` / `LoadPerfs(inDir)` | 数据导出配置 / 旧性能加载 |

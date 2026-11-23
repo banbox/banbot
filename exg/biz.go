@@ -3,9 +3,7 @@ package exg
 import (
 	"maps"
 	"slices"
-	"time"
 
-	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/utils"
@@ -200,46 +198,4 @@ func precNum(exchange banexg.BanExchange, symbol string, num float64, source str
 
 func PrecCost(exchange banexg.BanExchange, symbol string, cost float64) (float64, *errs.Error) {
 	return precNum(exchange, symbol, cost, "cost")
-}
-
-func PrecPrice(exchange banexg.BanExchange, symbol string, price float64) (float64, *errs.Error) {
-	return precNum(exchange, symbol, price, "price")
-}
-
-func PrecAmount(exchange banexg.BanExchange, symbol string, amount float64) (float64, *errs.Error) {
-	return precNum(exchange, symbol, amount, "amount")
-}
-
-func GetLeverage(symbol string, notional float64, account string) (float64, float64) {
-	return Default.GetLeverage(symbol, notional, account)
-}
-
-func GetOdBook(pair string) (*banexg.OrderBook, *errs.Error) {
-	book, ok := core.GetOdBook(pair)
-	if !ok || book == nil || book.TimeStamp+config.OdBookTtl < btime.TimeMS() {
-		var err *errs.Error
-		book, err = Default.FetchOrderBook(pair, 1000, nil)
-		if err != nil {
-			return nil, err
-		}
-		core.SetOdBook(pair, book)
-	}
-	return book, nil
-}
-
-func GetTickers24Hr() (map[string]*banexg.Ticker, *errs.Error) {
-	tickersMap := core.GetCacheVal("tickers", map[string]*banexg.Ticker{})
-	if len(tickersMap) > 0 {
-		return tickersMap, nil
-	}
-	tickers, err := Default.FetchTickers(nil, nil)
-	if err != nil {
-		return nil, err
-	}
-	for _, t := range tickers {
-		tickersMap[t.Symbol] = t
-	}
-	expires := time.Second * 3600
-	core.Cache.SetWithTTL("tickers", tickersMap, 1, expires)
-	return tickersMap, nil
 }

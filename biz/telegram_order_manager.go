@@ -15,11 +15,6 @@ type TelegramOrderManager struct {
 	commands *RemoteCommandService
 }
 
-// NewTelegramOrderManager 创建 Telegram 订单管理器
-func NewTelegramOrderManager() *TelegramOrderManager {
-	return &TelegramOrderManager{commands: defaultRemoteCommandService}
-}
-
 func NewTelegramOrderManagerWithRuntimeDeps(deps RuntimeDeps) *TelegramOrderManager {
 	return &TelegramOrderManager{deps: &deps, commands: NewRemoteCommandServiceWithRuntimeDeps(deps)}
 }
@@ -32,6 +27,10 @@ func (m *TelegramOrderManager) GetActiveOrders(account string) ([]*rpc.OrderInfo
 		defer lock.Unlock()
 		result := make([]*rpc.OrderInfo, 0, len(openOrders))
 		for _, order := range openOrders {
+			// Hub/shared runtimes keep closed (archived) projections in this registry too.
+			if order.Status >= ormo.InOutStatusFullExit {
+				continue
+			}
 			price := m.deps.Market.Prices.GetPriceSafeExpAt(m.deps.Clock.TimeMS(), order.Symbol, "", com.Day10MSecs)
 			result = append(result, buildTelegramOrderInfo(order, account, price))
 		}
@@ -104,7 +103,10 @@ func (m *TelegramOrderManager) CloseOrder(account string, orderID int64) error {
 		ExitTag:   "telegram_close",
 		Confirmed: true,
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 // CloseAllOrders 平仓所有订单
@@ -145,7 +147,10 @@ func (m *TelegramOrderManager) EnableTrading(account string) error {
 		Action:  RemoteActionTradingSwitch,
 		Enable:  true,
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 // GetOrderStats 获取订单统计信息
@@ -186,26 +191,6 @@ func (m *TelegramOrderManager) GetOrderStats(account string) (longCount, shortCo
 	}
 
 	return longCount, shortCount, nil
-}
-
-// InitTelegramOrderManager 初始化 Telegram 订单管理器
-func InitTelegramOrderManager() {
-	orderMgr := NewTelegramOrderManager()
-	rpc.SetOrderManager(orderMgr)
-
-	// 注册钱包信息提供者
-	rpc.SetWalletInfoProvider(walletInfoProvider{})
-
-	log.Info("Telegram order manager initialized")
-}
-
-// walletInfoProvider 实现钱包汇总接口
-type walletInfoProvider struct{}
-
-func (walletInfoProvider) GetSummary(account string) (totalLegal float64, availableLegal float64, unrealizedPOLLegal float64) {
-	w := GetWallets(account)
-	refreshStaleWalletForDisplay(w)
-	return w.TotalLegal(nil, true), w.AvaLegal(nil), w.UnrealizedPOLLegal(nil)
 }
 
 // refreshStaleWalletForDisplay 展示前若余额长时间未拉取，先同步最新余额

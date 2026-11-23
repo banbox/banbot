@@ -44,6 +44,7 @@
 | `config/runtime_config.go` | `LoadRuntimeSnapshot`（旧式直接构造 Snapshot）、`(*Config).NormalizeRuntime`（运行默认值与校验）、`NormalizeRunPolicies` |
 | `config/snapshot.go` | `Snapshot`：运行时不可变配置视图（DataDir/StrategyDir/location），`cloneSnapshotConfig` 深拷贝 |
 | `config/biz.go` | 旧全局安装器：`LoadConfig`、`GetConfig`、`ApplyConfig`（写 ~60 个包级全局 + `core.*` + `banexg.SetProxy`）、`SetRunPolicy`、`StaticPairs`、账户初始化、`Clone/Desensitize`、perf 加载、语言包、`ParsePairs` |
+| `config/notify_runtime.go` | `(*Config).CopyNotifications`：`Config.Clone` 有意不带通知段（`Desensitize` 与 Web 视图依赖这一点），按账户运行时配置经它把 `rpc_channels`、`mail`、`webhook` 及该账户的 `rpc_channels` 引用深拷贝进来；`inbound=false` 时去掉所有 `type: telegram` 渠道（会开 bot 监听或仪表盘连接）及账户对它们的引用，并返回被去掉的渠道名 |
 | `config/historical_coverage.go` | `HistoricalCoverageConfig`（回测历史覆盖声明的归一化与查询） |
 | `config/common.go` | 代理解析 `GetExchangeProxy` / `ExchangeProxyOption`（进程内只解析一次；macOS 读 `scutil --proxy`；无代理时返回显式 `"no"`）、`refine_tf` 解析与缓存（`EnsureStratRefineTF`） |
 | `config/exchange_capabilities.go` | 通过 banexg 适配器查询能力：`ExchangeUsesOpaqueSymbols`、`ExchangeDefaultLocation`；每个交易所名只创建一次适配器并缓存结果，且固定传 `Proxy="no"`（仅元数据，不发请求） |
@@ -76,7 +77,7 @@
 | `audit/README.md` | 审计命令的使用说明与边界（只读，不 apply） |
 | `cmd/orderinspect/main.go` | 一次性排查工具（读取 gob 订单，打印固定下标的订单） |
 | `internal/testutil/integration.go` | `RequireIntegration(t)` 集成测试跳过门槛 |
-| `scripts/` | `accept_backtest_baseline.sh`、`normalize_backtest_orders.py`、`architecture_performance.py`（及其测试与 .md）、`run_architecture_race.ps1`、`check_documentation_links.py`、`module_isolation_test.go`（build tag）、`china.py`（tushare 数据下载脚本） |
+| `scripts/` | `accept_backtest_baseline.sh`、`normalize_backtest_orders.py`、`architecture_performance.py`（及其测试与 .md）、`run_architecture_race.ps1`、`check_documentation_links.py`、`module_isolation_test.go`（build tag）、`typednil_test.go`（typed-nil 门禁，见「常见易踩坑」）、`china.py`（tushare 数据下载脚本） |
 | `docker/Dockerfile` | 应用镜像：基于 golang:1.26.8，克隆 banstrats，内置 QuestDB 9.3.2，`bot init` |
 | `docker/base/base.Dockerfile` `docker/base/Dockerfile` | 分阶段构建：基础镜像（预下载依赖）与增量镜像（`FROM banbot/banbase`） |
 | `docker/bot.yml` `docker/db.yml` | compose 样例：应用容器（8000/8001）与 QuestDB 容器（9000/8812/9009） |
@@ -233,13 +234,14 @@
 
 ### 顶层配置键（节选，`config/types.go`）
 
-- 交易环境：`env`（prod/test/dry_run，默认 dry_run）、`exchange.name`、`market_type`（spot/linear/inverse/margin…）、`stake_currency`（必填）、`pairs`、`pairlists`、`pairmgr`。
+- 交易环境：`env`（prod/test/dry_run，默认 dry_run；实盘只支持 prod/dry_run，`test` 在实盘启动时被拒绝）、`exchange.name`、`market_type`（spot/linear/inverse/margin…）、`stake_currency`（必填）、`pairs`、`pairlists`、`pairmgr`。
 - 资金：`stake_amount`、`stake_pct`、`max_stake_amt`、`wallet_amounts`、`draw_balance_over`、`low_cost_action`（ignore/keepBig/keepAll）、`leverage`、`margin_add_rate`。
-- 执行：`order_type`、`limit_vol_secs`、`put_limit_secs`、`stop_enter_bars`、`close_on_stuck`、`order_bar_max`、`max_open_orders`、`max_simul_open`、`fatal_stop`、`fatal_stop_hours`、`relay_sim_unfinish`、`take_over_strat`。
+- 执行：`order_type`、`limit_vol_secs`、`put_limit_secs`（execution 路径忽略）、`stop_enter_bars`、`close_on_stuck`、`order_bar_max`、`max_open_orders`、`max_simul_open`、`fatal_stop`、`fatal_stop_hours`、`relay_sim_unfinish`、`take_over_strat`。
 - 回测：`timerange` 或 `time_start/time_end`、`bt_net_cost`、`bt_strict`、`bt_bar_order_seed`（uint64 盐，默认 0；回测中同一 bar 时间多品种处理顺序的哈希盐，改变它即换一种确定性的"抽签"）、`bt_no_kline_download`（回测不下载 K 线写回共享库，缺数据时静默使用库内已有数据；单独开启可用，`bt_strict` 才要求 `historical_coverage`）、`bt_legacy_*`（历史兼容开关，含 `bt_legacy_approx_funding` 单边近似资金费兼容开关）、`bt_slippage_bps`（市价/止损成交的单边不利滑点，bp，0=关）、`bt_funding_apr`（回测中线性永续合约持仓的双边对称近似资金费，年化百分比，正向时多头支付、空头收取，0=关）、`bt_gap_bars` / `bt_gap_min_hours`（K 线空洞守卫与退市判定，见 05）、`bt_delist_penalty_bps`（退市强平在 `bt_slippage_bps` 之外额外的不利 bp，0=关）、`bt_fresh_equity`（默认开；权益曲线〔plots、日权益、回撤、Ulcer〕按未平仓订单当下求和而不是钱包缓存的 `UnrealizedPOL`，见 `opt/reports.go:BTResult.equityNow`、`config.Config.FreshEquity`；`false` 仅用于与旧结果对照）、`historical_coverage`。解析时 `config/biz.go:warnUnknownBtKeys` 按 `Config` 结构体 yaml 标签（`knownBtKeys`）对本构建不认识的顶层 `bt_*` 键打 WARN（非严格解析会静默忽略它们，WARN 带 `BtFeatureLevel`）。
-- 时间与 K 线：`timeframes`、`run_timeframes`、`kline_source`、`concur_num`、`odbook_ttl`、`ntp_lang_code`、`show_lang_code`。
+- 时间与 K 线：`timeframes`、`run_timeframes`、`kline_source`、`concur_num`、`odbook_ttl`（execution 路径忽略）、`ntp_lang_code`、`show_lang_code`。
 - 服务：`database`（url、auto_create、db_type、sid_registry_url、max_pool_size、qdb_mem_pct、qdb_max_mem_mb）、`api_server`（bind_ip、port、jwt_secret_key、users、CORS_origins）、`spider_addr`（默认 127.0.0.1:6789）、`mail`、`webhook`、`rpc_channels`、`bt_in_live`、`llm_models`、`strat_perf`。
 - 策略：`run_policy[]`（见 `RunPolicyConfig`）。v2 额外支持 `engine`（time_series/factor）、`id`、`account`、`capital_weight`、`factor{...}`（展开为扁平键）。
+- 实盘（execution 路径）忽略或拒绝的键与能力：见 `05_biz_orders_live.md`「支持矩阵」。
 - 高级覆盖：`data`（namespace、page_rows、prefetch_rows、prefetch_concurrency、page_bytes、archive、max_records、pit_policy）、`execution`（mode、store、history、sender_lease_dir、hub_socket、live_provider、funding_policy、order_mode、paper_fill_model、instruments、margin_rate…）、`accounts.<name>.<exec key>`。白名单见 `config/advanced.go` 的 `validateAdvanced`。
 
 ### 外部依赖
@@ -326,6 +328,7 @@
 - `utils.ParallelRun` 出错后不再启动新任务，但已启动的任务仍会执行完。
 - `com.GetPrice` 使用 10 秒过期（10000 毫秒），`GetPriceSafe` 使用 60 秒过期（`PriceExpireMS`），两者不一致，请按调用场景选择。
 - `core.IsFiat` 只检查子串 `USD` / `CNY`，凡包含这两个子串且不含 `/` 的符号都会按价格 1 返回。
+- **`*errs.Error` 转 `error` 的 typed-nil 门禁**（`scripts/typednil_test.go`，根目录运行 `go test ./scripts/ -run TestNoUnguardedErrsErrorToError -count=1`）：banexg 的 `*errs.Error` 为 nil 指针时转成 `error` 接口是非 nil，会把「成功」变成「失败」（如 `func() error` 里 `return session.Start()`）。门禁一次性对整个模块做类型检查，凡静态类型 `*errs.Error` 的值未经 nil 守卫流入静态类型 `error` 的位置即失败；检查的种类为 assign、assign-tuple、return、return-tuple、var、var-tuple、field、send，不检查调用实参；`if x != nil` / `x == nil` 的 else 内对 `x` 的返回、直接的 `errs.New*(...)` 调用视为已守卫。修复优先（`if e := f(); e != nil { return e }; return nil`）；确认已被检查器看不到的方式守卫时，才加入 `typedNilAllowlist`（`文件|所在函数|种类: 表达式文本` → 理由，不含行号）。白名单里不再命中的条目同样使门禁失败，修好或改名后须删除。`testing.Short()` 时跳过；构建不通过的包会被跳过（只记日志），所以门禁只覆盖当前能编译的包。
 
 ## 已知限制与设计取舍
 

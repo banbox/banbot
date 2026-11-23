@@ -72,6 +72,10 @@ accounts:
 - `no_trade: true` 的账户会跳过。
 - 未配置全局 `rpc_channels` 时不会创建任何渠道。
 
+## 共享账户（Hub）机器人
+
+在默认的 prod/dry-run 共享账户路径上，机器人的每个账户都有自己的通知会话。Telegram 渠道（`type: telegram`，包括账户对它的引用）只为第一个可交易账户启动（账户名最小者，排除 `no_trade` 账户；只有一个账户时即该账户），因为一个 bot token 在一个进程内只允许一个命令监听；其他账户跳过并记告警。企业微信和邮件渠道对每个账户都有效。消息异步发送：经容量 256 的有界队列，队列满时丢弃并告警。启动时发送状态消息，关停时发送 `bot stop` 消息并最多等待 3 秒，仍在队列中的消息会被丢弃。异常告警走同一队列。
+
 ## 企业微信与 Telegram
 
 企业微信使用 `type: wework`，填写 `corp_id`、`agent_id`、`corp_secret`、`touser`。Telegram 自建机器人使用 `type: telegram`，填写 `token`、`chat_id` 等字段；全部配置形式见配置模板。

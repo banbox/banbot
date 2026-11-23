@@ -182,6 +182,7 @@
 ### 7. 爬虫采集（LiveSpider）
 
 - `RunLiveSpiderWithRuntimeDeps`（data/spider.go:1099）→ `prepareLiveSpider`（:1119）：storage Prepare → startup → `consumeSeriesWriteQ`（:49）与 `monitorSubscriptions`。
+- `RunLiveSpiderWithRuntimeDeps` 在所属 runtime 的上下文取消时主动 `Stop` spider（关闭监听器），否则 `RunForever` 停在 `Accept` 上，`hub`/`spider` 进程不会响应 SIGINT/SIGTERM。
 - 客户端 `watch_pairs` / `unwatch_pairs`：`makeInitConn`（:1199）→ `getMiner`（:1154）→ `newMiner`（:467）。`Miner.SubPairs`（:522）分发到 `loopKLines`（:922，分钟 ticker 调 `FetchOHLCV`）、`watchKLines`（:784）、`watchTrades`（:622）、`watchOdBooks`（:722）、`watchPrices`（:676）。
 - K 线：`sidMap` / `writeQ`（spider.go:1043-1067）→ `consumeSeriesWriteQ` → `trySaveSeriesWithRuntimeDeps`（common.go:71）→ `observeClosedSeries` → Broadcast。`klineParallelNum=6`（spider.go:38）；writeQ 容量 9999（:337）。
 - 启动时 `data/spider.go:405` 调用 `EnsureTimescaleCompressionWithStorage`，随后 :408 调用 `purgeSpiderKlineUn`。
@@ -233,7 +234,7 @@
 ## 与其他模块的交互边界
 
 - **strat / DataHub**：策略通过 `DataSub` 声明订阅（`strat.DataSub` 与 `orm.Subscription` 为同一别名，strat/types.go:112）；`DataHub`（strat/datahub.go）按 `(tf, source, sid)` 缓存 `DataFields`。data 只负责把 `DataSeries` 投递给 `OnDataSeries` / 回调，不持有 DataHub。
-- **biz / live / opt**：`Trader.FeedDataSeries`、`CryptoTrader`、`BackTest` 消费 `DataSeries`。这些模块不应直接读写 sranges 或 QuestDB 表。
+- **biz / live / opt**：`Trader.FeedDataSeries`、`BackTest` 消费 `DataSeries`。这些模块不应直接读写 sranges 或 QuestDB 表。
 - **entry / base.go**：启动时的 `Setup` / `OpenStorage`、`EnsureExgSymbols`、`EnsureListDates`、`SetListMS` 由上层调用（data/ 内部不直接调用这些）。
 - **web / dev、api**：`/api/kline/series` 为只读查看接口（web/dev/api_dev.go:1922 调用 `FindSRanges`）。写入、补齐、删除必须经 `SeriesStore` / 数据源运行时。
 - **banbot 与 banexg**：交易所差异只在 banexg 内解决。banbot 的 data/ 不得出现 `if exchange == ...` 类分支。

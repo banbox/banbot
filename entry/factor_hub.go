@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 
+	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/data"
@@ -119,6 +120,7 @@ func (s *explicitEntrySession) runFactorHubAccount(ctx context.Context, snapshot
 		}
 	}
 	cfg := mixedLiveAccountConfig(snapshot.View(), c.AccountID, mixedLivePolicies(s.runSpec, c.AccountID))
+	cfg.APIServer = accountDashboardConfig(snapshot.View(), c.AccountID)
 	// Robot runtimes own public inputs and computation only. Even dry_run account
 	// execution and authoritative funding settlement belong to the Hub.
 	options := runtimepkg.Options{Context: ctx, Logger: s.logger, Config: cfg, DataDir: snapshot.DataDir, StrategyDir: snapshot.StrategyDir, Mode: core.RunModeData, Env: cfg.Env, Exchange: s.exchange, Storage: s.storage, ExchangeName: cfg.Exchange.Name, Market: cfg.MarketType, ContractType: cfg.ContractType, Pairs: cfg.Pairs, Catalog: catalog, HubMarketData: true, SourcePlanOptions: sourceOptions, NetDisable: s.netDisable, DisplayLocation: snapshot.Location()}
@@ -134,6 +136,19 @@ func (s *explicitEntrySession) runFactorHubAccount(ctx context.Context, snapshot
 		return err
 	}
 	defer func() { rt.Close(); rt.Join() }()
+	if binding.Legacy == nil {
+		// Factor-only robot: no time-series order manager, so give metrics and
+		// the dashboard a read-only (cached) view of the Hub account.
+		release, bindErr := biz.BindHubAccountReader(rt.BizDeps(), client, binding.Account, execution.PortfolioRisk{MarginRate: c.Execution.MarginRate, MaxAccountMargin: c.Execution.MaxAccountMargin, MaxVirtualGross: c.Execution.MaxVirtualGross})
+		if bindErr != nil {
+			return bindErr
+		}
+		defer release()
+	}
+	// Notifications (rpc_channels) for this execution-backed runtime; never fails the robot.
+	defer attachRuntimeNotifications(rt)()
+	rt.Core.LogFile = s.logArgs.Logfile
+	warnIgnoredExecutionConfig(snapshot.View())
 	for _, symbol := range binding.Symbols {
 		if err := rt.Symbols.CacheExSymbolChecked(symbol); err != nil {
 			return err
@@ -148,15 +163,22 @@ func (s *explicitEntrySession) runFactorHubAccount(ctx context.Context, snapshot
 			return err
 		}
 	}
+	// The dashboard reads the Hub ledger and this runtime's projections. The
+	// trader constructor and StartWebAPI return *errs.Error: keep them in
+	// dedicated variables so a nil pointer never becomes a non-nil error.
+	trader, traderErr := live.NewCryptoTraderWithRuntimeDeps(rt.BizDeps())
+	if traderErr != nil {
+		return traderErr
+	}
+	if apiErr := trader.StartWebAPI(); apiErr != nil {
+		return apiErr
+	}
 	if startup != nil {
-		trader, err := live.NewCryptoTraderWithRuntimeDeps(rt.BizDeps(), nil)
-		if err != nil {
-			return err
-		}
 		if err := startup(ctx, trader); err != nil {
 			return err
 		}
 	}
+	rt.NotifyStarted()
 	group := runner.NewComputationGroup()
 	engines := make([]*runner.Live, 0, len(configs))
 	intervals := []int64{}
@@ -200,16 +222,23 @@ func (s *explicitEntrySession) runFactorHubAccount(ctx context.Context, snapshot
 		intervals = append(intervals, c.DecisionInterval)
 		mappers = append(mappers, binding.Record)
 	}
-	provider, failures, err := rt.BindFactorsLive(engines, binding.Record, intervals)
-	if err != nil {
-		return err
+	provider, failures, bindErr := rt.BindFactorsLive(engines, binding.Record, intervals) // *errs.Error: do not store in `err` (typed-nil)
+	if bindErr != nil {
+		return bindErr
 	}
-	defer func() { rt.Stop(); result = errors.Join(result, provider.Stop()); provider.Join() }()
+	defer func() {
+		rt.Stop()
+		if stopErr := provider.Stop(); stopErr != nil {
+			result = errors.Join(result, stopErr)
+		}
+		provider.Join()
+	}()
 	installation, err := rt.InstallFactorsLive(provider, engines, configs, mappers)
 	if err != nil {
 		return err
 	}
 	defer func() { installation.Stop(); result = errors.Join(result, installation.Join()) }()
+	startExecutionRobotCrons(rt, trader, provider, legacySubscriptions(&binding))
 	select {
 	case <-ctx.Done():
 		return ctx.Err()

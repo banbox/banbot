@@ -72,6 +72,10 @@ accounts:
 - Accounts with `no_trade: true` are skipped.
 - Without a global `rpc_channels`, no channel is created.
 
+## Shared-account (Hub) robots
+
+On the default prod / dry-run shared-account path every account of a robot has its own notification session. Telegram channels (`type: telegram`, including account references to them) are started only for the first tradable account (smallest account name, `no_trade` accounts excluded; with a single account, that account), because one bot token allows a single command listener per process; the other accounts skip them and a warning is logged. WeCom and email channels work for every account. Messages are asynchronous: they go through a bounded queue of 256 and are dropped, with a warning, when it is full. A startup status message is sent, and a `bot stop` message is sent on shutdown with a wait of at most 3 seconds; anything still queued is discarded. Exception alerts are sent through the same queue.
+
 ## WeCom and Telegram
 
 WeCom uses `type: wework` with `corp_id`, `agent_id`, `corp_secret` and `touser`. A custom Telegram bot uses `type: telegram` with `token`, `chat_id` and related settings. See the configuration template for all forms.

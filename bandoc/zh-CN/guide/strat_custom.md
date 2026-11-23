@@ -568,6 +568,8 @@ type EnterReq struct {
 
 `Stop`是入场触发价（不是止损，止损请用`StopLoss`），做多订单可设置更高的价格等待突破后入场，做空订单可设置更低的价格挂单等待跌破后入场。
 
+在默认的prod/dry-run共享账户（Hub）路径上，订单价格（`Limit`、`StopLossLimit`、`TakeProfitLimit`、阶梯止盈各级的`Limit`，以及平仓请求和改单的`Limit`）提交前会按品种价格最小变动单位（tick）就近取整；触发价（`Stop`、`StopLoss`、`TakeProfit`、阶梯各级`Price`）不取整。
+
 同时设置`Stop`和`Limit`即为Stop-Limit入场：价格触及`Stop`后才以`Limit`挂限价单；若`Stop`已被当前价越过，则直接按`Limit`挂限价单。`OrderType`为`core.OrderTypeMarket`时不能设置`Limit`。
 
 例如当前价格为 100，等待突破 120 做多可设置 `&strat.EnterReq{Tag: "breakout", Stop: 120}`；突破 120 后最多愿意以 121 买入，并带止损：
@@ -593,6 +595,8 @@ LegalCost = AccountEquity() × RiskRate ÷ (|入场价 - 止损价| ÷ 入场价
 | `AccountEquity() float64` | 账户权益（余额+未平仓浮动盈亏，计价币）；预热或钱包未就绪时回退为初始资金/默认开单金额，不会返回0或NaN |
 | `AvailableBalance() float64` | 可用余额/可用保证金；不可用时为0 |
 | `AccountDrawdown() float64` | 相对运行以来权益峰值的回撤比例，`[0,1]`；预热期为0。同一账户下所有品种共享 |
+
+Hub 路径的机器人读取这些账户指标时，会共享一次最长 1 秒的缓存：在 `OnTick` 等亚秒级回调中，`AccountEquity()` 等返回值最多可能滞后 1 秒；1 分钟及以上周期的 K 线回调不受影响。
 
 ```go
 Main: func(s *strat.StratJob, _ strat.DataEvent) {
@@ -721,6 +725,8 @@ _ = s.OpenOrder(&strat.EnterReq{Tag: "trail", StopLossVal: atr * 2, ActivationPr
 | `Tag` | 本级退出原因 |
 
 各级按距离入场价由近到远依次触发，且不能与`TakeProfit`、`TakeProfitVal`、`TakeProfitLimit`同时使用；设置`TakeProfits`后`LongTPPrice/ShortTPPrice`不再生效。
+
+在默认的prod/dry-run共享账户（Hub）路径上，阶梯由机器人驱动：第一级是仓位的止盈，上一级被报告为已执行后才安装下一级（在机器人下一次轮询时看到，所以会略有延迟）。非末级若小于一个数量步长，会并入下一级。`Val`/`Rate`级先按参考价（`Limit`，否则`Stop`，否则中间价）估算，观察到入场成交后再按真实成交均价重算。某级解析出非正价格时入场会被拒绝；对带阶梯的订单做单级`TakeProfit`改单也会被拒绝。每次换级都会让追踪止损重新起算，由阶梯或止损触发的出场在订单视图中没有分级出场标签。
 ```go
 _ = s.OpenOrder(&strat.EnterReq{
     Tag: "ladder", StopLossVal: atr * 2,
@@ -743,6 +749,8 @@ _ = s.OpenOrder(&strat.EnterReq{
 _ = s.OpenOrder(&strat.EnterReq{Tag: "brk_long", Stop: hi, Limit: hi + slip, OCOGroup: "donchian", StopBars: 2, StopLossVal: atr * 2})
 _ = s.OpenOrder(&strat.EnterReq{Tag: "brk_short", Short: true, Stop: lo, Limit: lo - slip, OCOGroup: "donchian", StopBars: 2, StopLossVal: atr * 2})
 ```
+在默认的prod/dry-run共享账户（Hub）路径上，账户执行服务自己执行OCO：同一tick内有多个成员同时可执行时，只保留创建最早的一个，其余撤销；组内已有成员成交后，其余仍开放的未成交成员也被撤销。已有成交、在途交易所订单、占用预留或已有出场的成员不会被撤销；若多个成员都已成交则全部保留并记告警。机器人另会在观察到成交后补发撤销，被它撤销的成员以出场标签`oco_cancel`报告。
+
 分组按（品种、策略、`OCOGroup`）区分，用于挂单（设置了`Stop`或`Limit`）；回测中建议配合`refine_tf`，以便在同一根K线内更准确地判断两侧触发的先后。挂单占用开单名额，`max_simul_open`须足够。完整示例见 [banstrats/examples/tsfeatures](https://github.com/banbox/banstrats/tree/main/examples/tsfeatures) 的`bracket.go`。
 
 ## 批量任务处理

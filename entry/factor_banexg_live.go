@@ -13,6 +13,8 @@ import (
 	"github.com/banbox/banbot/factor/runner"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banexg"
+	"github.com/banbox/banexg/log"
+	"go.uber.org/zap"
 )
 
 // The production binding consumes SDK capabilities, never venue-name branches.
@@ -97,28 +99,48 @@ func factorFundingCapability(exchange banexg.BanExchange) (banexg.FundingCashCap
 	return nil, false
 }
 
+// factorFundingPollInterval spaces live funding polls. Venues settle funding
+// every one to eight hours and the income endpoint is heavily rate limited
+// (Binance: two weight-30 calls per window), so one account-wide poll per
+// minute covers every subscribed instrument.
+const factorFundingPollInterval = time.Minute
+
 func newFactorFundingSource(capability banexg.FundingCashCapability, c runner.Config) (*data.FuncDataSource, error) {
 	info := orm.NewSeriesInfo(c.FundingSource, "event", []orm.SeriesField{{Name: "settlement_id", Type: "string"}, {Name: "account_amount", Type: "string"}, {Name: "rate", Type: "string"}, {Name: "mark", Type: "string"}})
-	fetch := func(ctx context.Context, sub *orm.Subscription, start, end int64) ([]*orm.DataRecord, error) {
-		var records []*orm.DataRecord
+	// fetchAll returns the account's settlements in [start, end) for every
+	// instrument; the venue reports them account-wide.
+	fetchAll := func(ctx context.Context, start, end int64) ([]banexg.FundingCash, error) {
+		var all []banexg.FundingCash
 		for start < end {
 			until := min(end-1, start+7*24*time.Hour.Milliseconds())
 			rows, err := capability.FetchFundingCash(ctx, c.AccountID, c.Manifest.Currency, start, until)
 			if err != nil {
 				return nil, err
 			}
-			for _, row := range rows {
-				if row.Symbol == sub.ExSymbol.Symbol {
-					records = append(records, &orm.DataRecord{Sid: sub.ExSymbol.ID, TimeMS: row.AtMS, EndMS: row.AtMS, Closed: true, Values: map[string]any{"settlement_id": row.ID, "account_amount": row.Amount, "rate": row.Rate, "mark": row.Mark}})
-				}
-			}
+			all = append(all, rows...)
 			start = until + 1
 		}
-		return records, nil
+		return all, nil
+	}
+	records := func(sub *orm.Subscription, rows []banexg.FundingCash) []*orm.DataRecord {
+		var out []*orm.DataRecord
+		for _, row := range rows {
+			if row.Symbol == sub.ExSymbol.Symbol {
+				out = append(out, &orm.DataRecord{Sid: sub.ExSymbol.ID, TimeMS: row.AtMS, EndMS: row.AtMS, Closed: true, Values: map[string]any{"settlement_id": row.ID, "account_amount": row.Amount, "rate": row.Rate, "mark": row.Mark}})
+			}
+		}
+		return out
+	}
+	fetch := func(ctx context.Context, sub *orm.Subscription, start, end int64) ([]*orm.DataRecord, error) {
+		rows, err := fetchAll(ctx, start, end)
+		if err != nil {
+			return nil, err
+		}
+		return records(sub, rows), nil
 	}
 	return data.NewFuncDataSource(info, fetch, func(ctx context.Context, subs []*orm.Subscription, sink data.DataSink) error {
 		cursor := time.Now().UnixMilli()
-		ticker := time.NewTicker(5 * time.Second)
+		ticker := time.NewTicker(factorFundingPollInterval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -126,13 +148,18 @@ func newFactorFundingSource(capability banexg.FundingCashCapability, c runner.Co
 				return ctx.Err()
 			case <-ticker.C:
 				end := time.Now().UnixMilli() + 1
-				for _, sub := range subs {
-					rows, err := fetch(ctx, sub, max(0, cursor-60000), end)
-					if err != nil {
-						return err
+				rows, err := fetchAll(ctx, max(0, cursor-60000), end)
+				if err != nil {
+					if ctx.Err() == nil && execution.TransientVenueReadError(err) {
+						// Keep the cursor: the next poll covers this window again.
+						log.Warn("factor funding poll failed transiently; retrying", zap.Error(err))
+						continue
 					}
-					if len(rows) > 0 {
-						if err := sink.Emit(sub, rows); err != nil {
+					return err
+				}
+				for _, sub := range subs {
+					if out := records(sub, rows); len(out) > 0 {
+						if err := sink.Emit(sub, out); err != nil {
 							return err
 						}
 					}

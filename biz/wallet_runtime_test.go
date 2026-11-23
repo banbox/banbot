@@ -1,7 +1,6 @@
 package biz
 
 import (
-	"context"
 	"testing"
 
 	"github.com/banbox/banbot/btime"
@@ -57,43 +56,6 @@ func (s *walletRuntimeExchangeStub) WatchBalance(params map[string]interface{}) 
 	s.watchCalls++
 	s.watchAccount, _ = params[banexg.ParamAccount].(string)
 	return s.watchOut, nil
-}
-
-type walletRuntimeLifecycleStub struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	wait   []func()
-}
-
-func newWalletRuntimeLifecycleStub() *walletRuntimeLifecycleStub {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &walletRuntimeLifecycleStub{ctx: ctx, cancel: cancel}
-}
-
-func (s *walletRuntimeLifecycleStub) Context() context.Context { return s.ctx }
-
-func (s *walletRuntimeLifecycleStub) OnClose(func()) {}
-
-func (s *walletRuntimeLifecycleStub) OnCloseWait(call func()) {
-	if call != nil {
-		s.wait = append(s.wait, call)
-	}
-}
-
-func (s *walletRuntimeLifecycleStub) closeAndWait() {
-	s.cancel()
-	for _, call := range s.wait {
-		call()
-	}
-}
-
-type walletRuntimeDepsLifecycleStub struct {
-	*walletRuntimeLifecycleStub
-	deps RuntimeDeps
-}
-
-func (s *walletRuntimeDepsLifecycleStub) WalletRuntimeDeps() RuntimeDeps {
-	return s.deps
 }
 
 func TestRuntimeWalletUpdateOdsUsesBoundPriceAndExchange(t *testing.T) {
@@ -175,77 +137,6 @@ func TestRuntimeWalletUpdateOdsRequiresBoundExchange(t *testing.T) {
 	}
 	if legacyExchange.calls != 0 {
 		t.Fatalf("legacy exchange was used %d times, want 0", legacyExchange.calls)
-	}
-}
-
-func TestRuntimeWatchLiveBalancesDoesNotFallBackToGlobalExchange(t *testing.T) {
-	oldDefault := exg.Default
-	legacyExchange := &walletRuntimeExchangeStub{watchOut: make(chan *banexg.Balances)}
-	exg.Default = legacyExchange
-	oldAccounts := config.Accounts
-	oldEnvReal := core.EnvReal
-	const account = "runtime-watch-account"
-	config.Accounts = map[string]*config.AccountConfig{account: {}}
-	core.EnvReal = false
-	t.Cleanup(func() {
-		exg.Default = oldDefault
-		config.Accounts = oldAccounts
-		core.EnvReal = oldEnvReal
-		delete(accWallets, account)
-	})
-
-	lifecycle := newWalletRuntimeLifecycleStub()
-	watchLiveBalancesWithRuntime(lifecycle)
-	lifecycle.closeAndWait()
-	if legacyExchange.watchCalls != 0 {
-		t.Fatalf("legacy exchange was used %d times, want 0", legacyExchange.watchCalls)
-	}
-}
-
-func TestRuntimeWatchLiveBalancesUsesOwnedDependencies(t *testing.T) {
-	oldDefault, oldAccounts := exg.Default, config.Accounts
-	legacyExchange := &walletRuntimeExchangeStub{watchOut: make(chan *banexg.Balances)}
-	runtimeExchange := &walletRuntimeExchangeStub{watchOut: make(chan *banexg.Balances)}
-	exg.Default = legacyExchange
-	const account = "runtime-owned-watch-account"
-	config.Accounts = map[string]*config.AccountConfig{"legacy-watch-account": {}}
-	t.Cleanup(func() {
-		exg.Default = oldDefault
-		config.Accounts = oldAccounts
-	})
-
-	trading := NewTradingState()
-	lifecycle := &walletRuntimeDepsLifecycleStub{
-		walletRuntimeLifecycleStub: newWalletRuntimeLifecycleStub(),
-		deps: RuntimeDeps{
-			Trading:  trading,
-			Config:   config.NewSnapshot(&config.Config{Accounts: map[string]*config.AccountConfig{account: {}}}),
-			Accounts: map[string]*config.AccountConfig{account: {}},
-			Exchange: runtimeExchange,
-		},
-	}
-	watchLiveBalancesWithRuntime(lifecycle)
-	lifecycle.closeAndWait()
-
-	if runtimeExchange.watchCalls != 1 || runtimeExchange.watchAccount != account {
-		t.Fatalf("runtime watch calls/account = %d/%q, want 1/%q", runtimeExchange.watchCalls, runtimeExchange.watchAccount, account)
-	}
-	if legacyExchange.watchCalls != 0 {
-		t.Fatalf("legacy exchange was used %d times, want 0", legacyExchange.watchCalls)
-	}
-	if wallet := trading.Wallet(account); !wallet.runtimeBound {
-		t.Fatal("runtime watch wallet was not bound to explicit dependencies")
-	}
-}
-
-func TestRuntimeWalletSnapshotsRequireRuntimeClock(t *testing.T) {
-	lifecycle := newWalletRuntimeLifecycleStub()
-	StartLiveWalletSnapshotsWithRuntimeDeps(RuntimeDeps{
-		Trading: NewTradingState(),
-		Config:  config.NewSnapshot(&config.Config{Accounts: map[string]*config.AccountConfig{"runtime": {}}}),
-	}, lifecycle)
-	if len(lifecycle.wait) != 0 {
-		t.Fatalf("wallet snapshot worker registered without runtime clock")
 	}
 }
 

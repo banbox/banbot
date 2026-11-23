@@ -14,30 +14,16 @@ type ClientOrderCapability = banexg.ClientOrderCapability
 // refer to the generated identifier rather than the operation.
 type ClientOrderIDCapability = ClientOrderCapability
 
-// BuildClientOrderID keeps client-order formatting at the exchange boundary.
-// It is the compatibility facade for callers that cannot return an error. New
-// live paths should use BuildClientOrderIDChecked so an adapter failure cannot
-// silently change the exchange contract.
+// BuildClientOrderID keeps client-order formatting at the exchange boundary:
+// the adapter-owned capability when it is available and healthy, otherwise the
+// banexg legacy format.
 func BuildClientOrderID(exchange banexg.BanExchange, exchangeName, namespace string, orderID int64, clientID string, randomize bool) string {
-	value, err := BuildClientOrderIDChecked(exchange, exchangeName, namespace, orderID, clientID, randomize)
-	if err == nil {
-		return value
+	if capability := GetClientOrderCapability(exchange); capability != nil {
+		if value, err := callClientOrderCapability(capability, namespace, orderID, clientID, randomize); err == nil {
+			return value
+		}
 	}
 	return buildLegacyClientOrderID(exchange, exchangeName, namespace, orderID, clientID, randomize)
-}
-
-// BuildClientOrderIDChecked returns an adapter-owned identifier or an explicit
-// error when the adapter does not provide the capability or rejects it.
-func BuildClientOrderIDChecked(exchange banexg.BanExchange, exchangeName, namespace string, orderID int64, clientID string, randomize bool) (string, *errs.Error) {
-	if capability := GetClientOrderCapability(exchange); capability != nil {
-		value, err := callClientOrderCapability(capability, namespace, orderID, clientID, randomize)
-		if err != nil {
-			return "", err
-		}
-		return value, nil
-	}
-	return "", errs.NewMsg(errs.CodeNotSupport,
-		"exchange adapter does not provide client order capability")
 }
 
 func buildLegacyClientOrderID(_ banexg.BanExchange, exchangeName, namespace string, orderID int64, clientID string, randomize bool) string {

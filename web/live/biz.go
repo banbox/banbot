@@ -255,8 +255,67 @@ func (h *apiHandlers) getVersion(c *fiber.Ctx) error {
 	})
 }
 
+// executionAccount reports whether orders of this runtime are owned by an
+// execution account, and whether that account is remote (behind a Hub).
+func (h *apiHandlers) executionAccount(account string) (currency string, metrics strat.AccountMetrics, backed, remote bool) {
+	if !h.runtime() {
+		return "", strat.AccountMetrics{}, false, false
+	}
+	return biz.ExecutionAccountBalance(*h.deps, account)
+}
+
+// executionBalance answers the balance endpoints from the execution ledger:
+// one row in the settlement currency. There is no per-coin wallet to refresh.
+func (h *apiHandlers) executionBalance(c *fiber.Ctx, currency string, metrics strat.AccountMetrics) error {
+	if !metrics.Valid {
+		return errs.NewMsg(core.ErrRunTime, "execution account balance is unavailable")
+	}
+	return c.JSON(fiber.Map{
+		"items": []map[string]interface{}{{
+			"symbol":     currency,
+			"total":      metrics.Equity,
+			"upol":       0.0,
+			"free":       metrics.Available,
+			"used":       metrics.Equity - metrics.Available,
+			"total_fiat": metrics.Equity,
+		}},
+		"total": metrics.Equity,
+	})
+}
+
+const errExecutionOwnedPosition = "positions belong to the execution account; close the strategy orders instead of sending a raw exchange order"
+const errNoAccountBinding = "this robot has neither an order manager nor an execution account binding for the account (factor-only Hub robot); account balance, orders and exchange data are unavailable here"
+const errNoOrderManager = "this robot has no order manager for the account, so strategy orders cannot be closed from the dashboard"
+const errHubPrivateData = "this robot holds no account credentials; private exchange data is available from the Hub account owner only"
+
+// unboundAccount reports a runtime that can answer nothing about the account:
+// it has no order manager and its orders are not owned by an execution account
+// either. A factor-only Hub robot normally has a read-only biz.HubAccountReader
+// binding (entry/factor_hub.go) and is then execution-backed; only a runtime
+// without one lands here.
+func (h *apiHandlers) unboundAccount(account string) bool {
+	if !h.runtime() {
+		return false
+	}
+	if _, _, backed, _ := h.executionAccount(account); backed {
+		return false
+	}
+	// Only data-mode runtimes (no legacy trading composition at all) are refused;
+	// a legacy runtime always builds its order manager before the API starts.
+	if h.deps.Core == nil || h.deps.Core.RunMode != core.RunModeData {
+		return false
+	}
+	return h.deps.Trading == nil || h.deps.Trading.OrderManager(account) == nil
+}
+
 func (h *apiHandlers) getBalance(c *fiber.Ctx) error {
 	return wrapAccount(c, func(account string) error {
+		if currency, metrics, backed, _ := h.executionAccount(account); backed {
+			return h.executionBalance(c, currency, metrics)
+		}
+		if h.unboundAccount(account) {
+			return errs.NewMsg(core.ErrBadConfig, errNoAccountBinding)
+		}
 		wallet := h.wallet(account)
 		if wallet == nil {
 			return errs.NewMsg(core.ErrBadConfig, "runtime trading state is required")
@@ -329,6 +388,12 @@ func (h *apiHandlers) walletItems(wallet *biz.BanWallets) []map[string]interface
 
 func (h *apiHandlers) postRefreshWallet(c *fiber.Ctx) error {
 	return wrapAccount(c, func(account string) error {
+		if currency, metrics, backed, _ := h.executionAccount(account); backed {
+			return h.executionBalance(c, currency, metrics)
+		}
+		if h.unboundAccount(account) {
+			return errs.NewMsg(core.ErrBadConfig, errNoAccountBinding)
+		}
 		wallet := h.wallet(account)
 		if wallet == nil {
 			return errs.NewMsg(core.ErrBadConfig, "runtime trading state is required")
@@ -408,9 +473,15 @@ func (h *apiHandlers) getStatistics(c *fiber.Ctx) error {
 		if err != nil {
 			return err
 		}
-		wallets := h.wallet(acc)
-		if wallets == nil {
-			return errs.NewMsg(core.ErrBadConfig, "runtime trading state is required")
+		_, _, backed, _ := h.executionAccount(acc)
+		var wallets *biz.BanWallets
+		if !backed {
+			if h.unboundAccount(acc) {
+				return errs.NewMsg(core.ErrBadConfig, errNoAccountBinding)
+			}
+			if wallets = h.wallet(acc); wallets == nil {
+				return errs.NewMsg(core.ErrBadConfig, "runtime trading state is required")
+			}
 		}
 		var totalDuration int64 // All order holding seconds 所有订单持仓秒数
 		var profitSum, profitRateSum, totalCost float64
@@ -478,10 +549,16 @@ func (h *apiHandlers) getStatistics(c *fiber.Ctx) error {
 		}
 
 		expProfit, expRatio := utils.CalcExpectancy(dayProfits)
-		if err := h.syncWallet(wallets, false); err != nil {
-			log.Warn("refresh stale wallet fail", zap.String("acc", acc), zap.Error(err))
+		var totalLegal float64
+		if _, metrics, _, _ := h.executionAccount(acc); backed {
+			totalLegal = metrics.Equity
+		} else {
+			if err := h.syncWallet(wallets, false); err != nil {
+				log.Warn("refresh stale wallet fail", zap.String("acc", acc), zap.Error(err))
+			}
+			totalLegal = wallets.TotalLegal(nil, true)
 		}
-		initBalance := wallets.TotalLegal(nil, true) - profitSum
+		initBalance := totalLegal - profitSum
 		ddPct, ddVal, _, _, _, _ := utils.CalcMaxDrawDown(dayProfits, initBalance)
 
 		jobs := h.jobs(acc)
@@ -489,6 +566,9 @@ func (h *apiHandlers) getStatistics(c *fiber.Ctx) error {
 		tfMap := make(map[string]bool)
 		for key := range jobs {
 			arr := strings.Split(key, "_")
+			if len(arr) < 2 {
+				continue
+			}
 			pairs[arr[0]] = true
 			tfMap[arr[1]] = true
 		}
@@ -589,6 +669,26 @@ func (h *apiHandlers) getOrders(c *fiber.Ctx) error {
 		if err != nil {
 			return err
 		}
+		// An execution-backed runtime stores closed orders only; its open orders
+		// are projections of the account ledger held in memory. They are listed
+		// from copies because pricing below updates the order it is given.
+		if _, _, backed, _ := h.executionAccount(acc); backed && status != 2 {
+			if open, lock := h.openOrders(acc); open != nil {
+				lock.Lock()
+				for _, od := range open {
+					if od == nil || od.Status >= ormo.InOutStatusFullExit ||
+						data.Strategy != "" && od.Strategy != data.Strategy ||
+						data.TimeFrame != "" && od.Timeframe != data.TimeFrame ||
+						data.EnterTag != "" && od.EnterTag != data.EnterTag ||
+						len(symbols) > 0 && !slices.Contains(symbols, od.Symbol) ||
+						odDirt == core.OdDirtLong && od.Short || odDirt == core.OdDirtShort && !od.Short {
+						continue
+					}
+					orders = append(orders, od.Clone())
+				}
+				lock.Unlock()
+			}
+		}
 		odList := make([]*OdWrap, 0, len(orders))
 		minStatus, maxStatus := int64(ormo.InOutStatusInit), int64(ormo.InOutStatusDelete)
 		if data.Status == "open" {
@@ -603,7 +703,12 @@ func (h *apiHandlers) getOrders(c *fiber.Ctx) error {
 				continue
 			}
 			price := float64(0)
-			if od.ExitTag != "" && od.Exit != nil && od.Exit.Price > 0 {
+			if od.Status >= ormo.InOutStatusFullExit && od.Exit != nil && od.Exit.Average > 0 {
+				// A closed order is final: its stored profit must not be re-marked
+				// at the current price (a market exit has no limit price to fall
+				// back on, so the branch below used to do exactly that).
+				price = od.Exit.Average
+			} else if od.ExitTag != "" && od.Exit != nil && od.Exit.Price > 0 {
 				price = od.Exit.Price
 			} else {
 				price = h.price(od.Symbol)
@@ -629,6 +734,12 @@ func (h *apiHandlers) getOrders(c *fiber.Ctx) error {
 		})
 	}
 	getExgOrders := func(acc string) error {
+		if _, _, _, remote := h.executionAccount(acc); remote {
+			return errs.NewMsg(core.ErrBadConfig, errHubPrivateData)
+		}
+		if h.unboundAccount(acc) {
+			return errs.NewMsg(core.ErrBadConfig, errNoAccountBinding)
+		}
 		exchange := h.exchange()
 		if exchange == nil {
 			return errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required")
@@ -669,6 +780,12 @@ func (h *apiHandlers) getOrders(c *fiber.Ctx) error {
 		var symbols []string
 		if data.Symbols != "" {
 			symbols = strings.Split(data.Symbols, ",")
+		}
+		if _, _, _, remote := h.executionAccount(acc); remote {
+			return errs.NewMsg(core.ErrBadConfig, errHubPrivateData)
+		}
+		if h.unboundAccount(acc) {
+			return errs.NewMsg(core.ErrBadConfig, errNoAccountBinding)
 		}
 		exchange := h.exchange()
 		if exchange == nil {
@@ -772,6 +889,9 @@ func (h *apiHandlers) postExitOrder(c *fiber.Ctx) error {
 			}
 			orderID = parsed
 		}
+		if h.runtime() && (h.deps.Trading == nil || h.deps.Trading.OrderManager(acc) == nil) {
+			return errs.NewMsg(core.ErrBadConfig, errNoOrderManager)
+		}
 		res, err := h.remote.CloseOrders(biz.RemoteCommand{
 			Source:      biz.RemoteSourceWeb,
 			Actor:       c.IP(),
@@ -810,6 +930,15 @@ func (h *apiHandlers) postCloseExgPos(c *fiber.Ctx) error {
 		return err
 	}
 	return wrapAccount(c, func(acc string) error {
+		if _, _, backed, _ := h.executionAccount(acc); backed {
+			return errs.NewMsg(core.ErrBadConfig, errExecutionOwnedPosition)
+		}
+		if h.unboundAccount(acc) {
+			return errs.NewMsg(core.ErrBadConfig, errNoAccountBinding)
+		}
+		if h.exchange() == nil {
+			return errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required")
+		}
 		doneNum := 0
 		res, err := h.remote.Run(biz.RemoteCommand{
 			Source:      biz.RemoteSourceWeb,
@@ -897,6 +1026,12 @@ func (h *apiHandlers) getIncomes(c *fiber.Ctx) error {
 		return err
 	}
 	return wrapAccount(c, func(acc string) error {
+		if _, _, _, remote := h.executionAccount(acc); remote {
+			return errs.NewMsg(core.ErrBadConfig, errHubPrivateData)
+		}
+		if h.unboundAccount(acc) {
+			return errs.NewMsg(core.ErrBadConfig, errNoAccountBinding)
+		}
 		exchange := h.exchange()
 		if exchange == nil {
 			return errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required")
@@ -972,6 +1107,9 @@ func (h *apiHandlers) getStratJobs(c *fiber.Ctx) error {
 		defer lock.Unlock()
 		for pairTF, jobMap := range jobs {
 			arr := strings.Split(pairTF, "_")
+			if len(arr) < 2 {
+				continue
+			}
 			price := h.price(arr[0])
 			for stgName, job := range jobMap {
 				var odNum = 0
@@ -1052,7 +1190,7 @@ type GroupItem struct {
 }
 
 func (h *apiHandlers) performanceDate(timestamp int64, format string) string {
-	if h.deps != nil {
+	if h.deps != nil && h.deps.ConfigView() != nil {
 		return btime.ToTime(timestamp).In(h.deps.Config.Location()).Format(format)
 	}
 	return btime.ToDateStrLoc(timestamp, format)
@@ -1267,6 +1405,12 @@ func (h *apiHandlers) postStartDownTrade(c *fiber.Ctx) error {
 		return err_
 	}
 	return wrapAccount(c, func(acc string) error {
+		if _, _, _, remote := h.executionAccount(acc); remote {
+			return errs.NewMsg(core.ErrBadConfig, errHubPrivateData)
+		}
+		if h.unboundAccount(acc) {
+			return errs.NewMsg(core.ErrBadConfig, errNoAccountBinding)
+		}
 		exchange := h.exchange()
 		if exchange == nil {
 			return errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required")
@@ -1289,6 +1433,12 @@ func (h *apiHandlers) getDownTrade(c *fiber.Ctx) error {
 		return err_
 	}
 	return wrapAccount(c, func(acc string) error {
+		if _, _, _, remote := h.executionAccount(acc); remote {
+			return errs.NewMsg(core.ErrBadConfig, errHubPrivateData)
+		}
+		if h.unboundAccount(acc) {
+			return errs.NewMsg(core.ErrBadConfig, errNoAccountBinding)
+		}
 		exchange := h.exchange()
 		if exchange == nil {
 			return errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required")
@@ -1312,7 +1462,10 @@ func (h *apiHandlers) getLog(c *fiber.Ctx) error {
 	}
 	logFile := log.LogFilePath()
 	if h.runtime() {
-		logFile = h.deps.Core.LogFile
+		logFile = ""
+		if h.deps.Core != nil {
+			logFile = h.deps.Core.LogFile
+		}
 	}
 	if logFile == "" {
 		return c.JSON(fiber.Map{"code": 400, "msg": "no log file"})

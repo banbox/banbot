@@ -17,6 +17,8 @@ import (
 	"github.com/banbox/banbot/live"
 	"github.com/banbox/banbot/orm"
 	runtimepkg "github.com/banbox/banbot/runtime"
+	"github.com/banbox/banexg/log"
+	"go.uber.org/zap"
 )
 
 func timeSeriesUsesHub(spec *config.RunSpec, accounts []string) bool {
@@ -47,6 +49,9 @@ func runTimeSeriesHubSpec(ctx context.Context, args *config.CmdArgs, spec *confi
 	}
 	if err := ensureRobotPublicExchange(session, public); err != nil {
 		return err
+	}
+	if profileErr := session.startProfiles(); profileErr != nil {
+		return profileErr
 	}
 	bindings := make([]FactorLiveBinding, len(accounts))
 	clients := make([]*execution.HubClient, len(accounts))
@@ -134,6 +139,7 @@ func (s *explicitEntrySession) runTimeSeriesHubAccount(ctx context.Context, snap
 		return err
 	}
 	cfg := mixedLiveAccountConfig(snapshot.View(), c.AccountID, mixedLivePolicies(s.runSpec, c.AccountID))
+	cfg.APIServer = accountDashboardConfig(snapshot.View(), c.AccountID)
 	// The SDK above has public capabilities only; private account lifecycle stays
 	// behind the Hub socket. In particular no SharedExecution owner is created.
 	rt, err := s.process.NewRuntime(runtimepkg.Options{Context: ctx, Logger: s.logger, Config: cfg, DataDir: snapshot.DataDir, StrategyDir: snapshot.StrategyDir, Mode: core.RunModeLive, Env: cfg.Env, Exchange: s.exchange, Storage: s.storage, ExchangeName: cfg.Exchange.Name, Market: cfg.MarketType, ContractType: cfg.ContractType, Pairs: cfg.Pairs, Catalog: catalog, HubMarketData: true, HubOrderBridge: bridge, SourcePlanOptions: sourceOptions, NetDisable: s.netDisable, DisplayLocation: snapshot.Location()})
@@ -141,6 +147,10 @@ func (s *explicitEntrySession) runTimeSeriesHubAccount(ctx context.Context, snap
 		return err
 	}
 	defer func() { rt.Close(); rt.Join() }()
+	// Notifications (rpc_channels) for this execution-backed runtime; never fails the robot.
+	defer attachRuntimeNotifications(rt)()
+	rt.Core.LogFile = s.logArgs.Logfile
+	warnIgnoredExecutionConfig(snapshot.View())
 	for _, symbol := range binding.Symbols {
 		if err := rt.Symbols.CacheExSymbolChecked(symbol); err != nil {
 			return err
@@ -153,30 +163,45 @@ func (s *explicitEntrySession) runTimeSeriesHubAccount(ctx context.Context, snap
 	} else if err := rt.BindFactorLegacyJobs(binding.Legacy.Jobs, binding.Legacy.Subscriptions); err != nil {
 		return err
 	}
+	trader, traderErr := live.NewCryptoTraderWithRuntimeDeps(rt.BizDeps())
+	if traderErr != nil {
+		return traderErr
+	}
+	// The dashboard reads this runtime's projected orders and archived history.
+	if apiErr := trader.StartWebAPI(); apiErr != nil {
+		return apiErr
+	}
 	if startup != nil {
-		trader, err := live.NewCryptoTraderWithRuntimeDeps(rt.BizDeps(), nil)
-		if err != nil {
-			return err
-		}
 		if err := startup(ctx, trader); err != nil {
 			return err
 		}
 	}
-	provider, err := rt.NewFactorLiveProvider(func(*orm.DataSeries) {}, nil)
-	if err != nil {
-		return err
+	rt.NotifyStarted()
+	// NewFactorLiveProvider returns *errs.Error: assigning it to the function's
+	// error variable would turn a nil pointer into a non-nil error and end the
+	// robot with an empty error right after startup.
+	provider, providerErr := rt.NewFactorLiveProvider(func(*orm.DataSeries) {}, nil)
+	if providerErr != nil {
+		return providerErr
 	}
 	installation, err := rt.InstallTimeSeriesLive(provider)
 	if err != nil {
 		return err
 	}
 	defer func() { installation.Stop(); result = errors.Join(result, installation.Join()) }()
+	startExecutionRobotCrons(rt, trader, provider, binding.Legacy.Subscriptions)
+	// The process exits when this returns, and a cancellation is reported
+	// upstream as a clean stop: record which side ended the robot.
 	select {
 	case <-ctx.Done():
+		log.Warn("time-series robot stopping: entry context ended", zap.String("account", c.AccountID), zap.Error(context.Cause(ctx)))
 		return ctx.Err()
 	case <-rt.Context().Done():
-		return hubRobotRuntimeError(rt, c.AccountID)
+		err := hubRobotRuntimeError(rt, c.AccountID)
+		log.Warn("time-series robot stopping: runtime ended", zap.String("account", c.AccountID), zap.Error(err), zap.NamedError("cause", context.Cause(rt.Context())))
+		return err
 	case err := <-installation.Errors():
+		log.Warn("time-series robot stopping: market data subscription ended", zap.String("account", c.AccountID), zap.Error(err))
 		return err
 	}
 }

@@ -14,6 +14,36 @@ identity. Restarting or repeatedly calling recovery cannot repair this case.
 Do not edit the SQLite order state, delete dedup rows, resubmit the intent, or
 book the same fill as both an external position and a strategy fill.
 
+## Entries excluded by the owner are not rejected orders
+
+When the autonomous pending tick is refused with a deterministic pre-commit
+code (`limit_off_tick`, `risk_limit`, `spot_short`, `venue_minimum`), the owner
+may end one admitted, increasing entry that has no live venue order or
+reservation, in the same commit as the plan that excludes it
+(`pending_isolation.go`). The lot ends `Canceled` with a `pending-isolated:<lot>`
+checkpoint and a `StrategyAcceptedEvent` carrying `Rejected`. This is not an
+exchange `Rejected` order: nothing was sent, no fill can contradict it, and no
+repair or account freeze follows. Unclassified errors, errors after commit,
+reductions, and entries that never passed owner admission (the backtest-only
+`SharedOrderMgr` writes its pending book directly) are not isolated; they fail
+the private report step and the account stays frozen until reconciled.
+
+Transient venue read failures (network, timeout, rate limit, temporary ban,
+overload, indeterminate result, deadline, account depth not yet visible) are not
+failures of that step: the worker skips the tick, the account stays unready and
+refuses new entries (`account_not_ready`) until a reconciliation succeeds, and no
+freeze or repair follows. A freeze logs `account frozen by the private report worker`
+with its reason and error.
+
+## OCO siblings cancelled by the owner are not rejected orders
+
+An OCO entry group member cancelled by the owner (`pending_oco.go`, reason
+`oco_simultaneous` or `oco_filled_sibling`) ends `Canceled` in the same commit
+as the plan, with a `pending-oco:<lot>` checkpoint and a `StrategyAcceptedEvent`
+carrying `Rejected`. Nothing was sent for it, no fill can contradict it and no
+repair follows. Members with fills, live venue orders, reservations or exits
+are never cancelled.
+
 ## Incident procedure
 
 1. Stop new strategy submissions for the affected physical account and stop

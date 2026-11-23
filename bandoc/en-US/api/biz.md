@@ -10,9 +10,6 @@ Current traders receive one Runtime's core state, clock, market, strategies, ord
 
 ## Main Structures
 
-### LiveOrderMgr
-Live order manager for managing orders in live trading. Inherits from `OrderMgr`.
-
 ### OrderMgr
 Base order manager class that provides basic order management functionality.
 
@@ -26,23 +23,14 @@ Order manager interface that defines basic order management methods.
 Main methods:
 - `ProcessOrders`: Process order requests
 - `EnterOrder`: Process entry orders
-- `EditOrder`: Submit an order modification (e.g. stop-loss/take-profit or trailing-stop change); queued in live, a no-op in the local backtest manager
+- `EditOrder`: Submit an order modification (e.g. stop-loss/take-profit or trailing-stop change); turned into a pending command by execution managers, a no-op in the local backtest manager
 - `RelayOrders`: Copy existing orders into new orders under this manager (relay/takeover)
 - `ExitOpenOrders`: Process exit orders
 - `ExitOrder`: Process single order exit
 - `UpdateByDataSeries`: Update order status based on candlestick
-- `ExitAndFill`: Submit an exit request for the given orders; the local (backtest/simulation) manager then fills it at the latest price (the last bar price in backtests), while the live manager only submits the exit
+- `ExitAndFill`: Submit an exit request for the given orders; the local (backtest/simulation) manager then fills it at the latest price (the last bar price in backtests), while execution managers only submit the exit
 - `OnEnvEnd`: Handle environment end
 - `CleanUp`: Clean up resources
-
-### IOrderMgrLive
-Live order manager interface, inherits from `IOrderMgr`.
-
-Additional methods:
-- `SyncExgOrders`: Synchronize exchange orders
-- `WatchMyTrades`: Monitor account trades
-- `TrialUnMatchesForever`: Continuously monitor unmatched trades
-- `ConsumeOrderQueue`: Consume order queue
 
 ### ItemWallet
 Single currency wallet.
@@ -153,31 +141,8 @@ Get all order managers.
 Returns:
 - `map[string]IOrderMgr` - Mapping of account names to order managers
 
-### GetLiveOdMgr
-Get live order manager.
-
-Parameters:
-- `account`: string - Account name
-
-Returns:
-- `*LiveOrderMgr` - Live order manager
-
-### CleanUpOdMgr
-Clean up order manager.
-
-Returns:
-- `*errs.Error` - Error information
-
-### InitLiveOrderMgr
-Initialize live order manager.
-
-Parameters:
-- `callBack`: func(od *ormo.InOutOrder, isEnter bool) - Order callback function
-
-Implementation Details:
-- Create live order managers for each account
-- Set order callback function
-- Used for managing real-time trading orders
+### CleanUpOdMgrWithState
+Close the order managers owned by one task state: `CleanUpOdMgrWithState(state *TradingState) *errs.Error`.
 
 ### InitLocalOrderMgr
 Initialize local order manager.
@@ -187,20 +152,11 @@ Parameters:
 - `showLog`: bool - Whether to display logs
 - `stops`: ...func() - Optional stop callbacks
 
-### VerifyTriggerOds
-Verify trigger orders.
-
-### StartLiveOdMgr
-Start live order manager.
-
 ### InitFakeWallets
 Initialize simulation wallets: `InitFakeWallets(symbols ...string)`.
 
 ### GetWallets
 `GetWallets(account string) *BanWallets` reads the compatibility registry. For an explicit task use `rt.Trading.Wallet(account)`.
-
-### WatchLiveBalances
-`WatchLiveBalances(lifecycles ...WalletRuntimeLifecycle)` monitors live balance updates; standard live assembly supplies its owning lifecycle.
 
 ## Factor-engine integration
 
@@ -227,10 +183,10 @@ OnEnvEnd(evt *orm.DataSeries) *errs.Error
 CleanUp() *errs.Error
 ```
 
-Embedded applications use `GetOdMgrWithState(rt.Trading, account)`, `GetAllOdMgrWithState(rt.Trading)`, `GetLiveOdMgrWithState(rt.Trading, account)` and `rt.Trading.Wallet(account)` for task state. Check nil: disabled accounts may have no manager. Package-level versions without State query only compatibility registries.
+Embedded applications use `GetOdMgrWithState(rt.Trading, account)`, `GetAllOdMgrWithState(rt.Trading)` and `rt.Trading.Wallet(account)` for task state. Check nil: disabled accounts may have no manager. Package-level versions without State query only compatibility registries.
 
-InitOdSubs, InitLiveOrderMgr, InitLocalOrderMgr, InitFakeWallets and StartLiveOdMgr have WithRuntimeDeps variants for new assembly paths. WatchLiveBalances accepts WalletRuntimeLifecycle; standard live entry assembly binds the owning Runtime and manages stop/join. InitLocalOrderMgr also accepts `stops ...func()`. Runtime.Accounts/AccountsMu provides mutable execution configuration shared by manager, wallet and job; the Config snapshot is read-only.
+InitOdSubs, InitLocalOrderMgr and InitFakeWallets have WithRuntimeDeps variants for new assembly paths. InitLocalOrderMgr also accepts `stops ...func()`. Runtime.Accounts/AccountsMu provides mutable execution configuration shared by manager, wallet and job; the Config snapshot is read-only.
 
-Live wallet balances come from the exchange; simulation/backtest balances do not certify real available funds. Only the compatibility `LiveOrderMgr` direct-send branch closes an order locally on CreateOrder errors, including timeouts; later reconciliation may recover the actual order. This does not describe the default Hub/shared-account execution path: shared execution retains `Unknown` or other unresolved states, blocks ordinary position changes and rejects blind retries with new commands. Recover with the original command ID and identical content, then verify exchange evidence. See [Shared accounts and Hub](../guide/execution.md).
+Live and dry_run order managers always come from the execution module (`HubOrderMgr`, shared accounts); the old `LiveOrderMgr` was deleted, and the capabilities that only the old stack provided are listed in the support matrix of [Live trading](../guide/live_trading.md). Simulation/backtest balances do not certify real available funds. Shared execution retains `Unknown` or other unresolved states, blocks ordinary position changes and rejects blind retries with new commands. Recover with the original command ID and identical content, then verify exchange evidence. See [Shared accounts and Hub](../guide/execution.md).
 
 See [Runtime API](runtime.md) and the [strategy guide](../guide/strat_custom.md).

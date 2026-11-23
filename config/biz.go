@@ -649,13 +649,6 @@ func (c *Config) StaticPairs() ([]string, bool) {
 	return res, needCalc
 }
 
-func GetTakeOverTF(pair, defTF string) string {
-	if tf, ok := core.LegacyStrategyTimeFrame(TakeOverStrat, pair); ok {
-		return tf
-	}
-	return defTF
-}
-
 func GetAccLeverage(account string) float64 {
 	acc, ok := Accounts[account]
 	if ok && acc.Leverage > 0 {
@@ -1537,10 +1530,6 @@ func (a *AccountConfig) GetApiSecret() *ApiSecretConfig {
 		exchangeName = Exchange.Name
 	}
 	return a.GetApiSecretFor(exchangeName, core.RunEnv)
-}
-
-func LoadPerfs(inDir string) {
-	LoadPerfsWithCoreState(inDir, nil, StratPerf)
 }
 
 // LoadPerfsWithCoreState loads persisted strategy performance into the

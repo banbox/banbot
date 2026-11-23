@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"sort"
 	"sync/atomic"
 	"time"
 
@@ -41,6 +42,10 @@ type BanexgExecutionProof struct {
 type BanexgInstrument struct {
 	Symbol     string
 	Instrument Instrument
+	// Leverage is the venue leverage declared for this instrument at account
+	// registration. Zero leaves the venue setting untouched. A declared value
+	// is applied once by ApplyLeverage before the account may send orders.
+	Leverage int `json:",omitempty"`
 }
 
 type BanexgAdapterConfig struct {
@@ -61,6 +66,9 @@ type BanexgAdapter struct {
 	byID     map[string]BanexgInstrument
 	bySymbol map[string]Instrument
 	store    atomic.Pointer[Store]
+	// leveraged is true once every declared venue leverage has been applied,
+	// or when no instrument declares one.
+	leveraged atomic.Bool
 }
 
 func missingBanexgBinding(value any) bool {
@@ -122,10 +130,53 @@ func NewBanexgAdapter(ctx context.Context, exchange banexg.BanExchange, config B
 		}
 		a.byID[entry.Instrument.ID], a.bySymbol[entry.Symbol] = entry, entry.Instrument
 	}
+	declared := false
+	for _, entry := range config.Instruments {
+		if entry.Leverage < 0 || entry.Leverage > 125 {
+			return nil, errors.New("execution: declared venue leverage must be between 1 and 125")
+		}
+		declared = declared || entry.Leverage > 0
+	}
+	if declared && !exchange.HasApi(banexg.ApiSetLeverage, "") {
+		return nil, errors.New("execution: declared venue leverage requires the SetLeverage API")
+	}
+	a.leveraged.Store(!declared)
 	if a.config.QuoteTTL <= 0 {
 		a.config.QuoteTTL = 2 * time.Second
 	}
 	return a, nil
+}
+
+// ApplyLeverage sets every declared instrument leverage at the venue, in
+// instrument order. It must succeed once after the adapter is bound and before
+// the account sends orders: Submit refuses orders until then, so a venue that
+// kept a different leverage never receives an order sized for the declared one.
+// Setting the same value again is harmless, so a restart simply reapplies it.
+func (a *BanexgAdapter) ApplyLeverage(ctx context.Context) error {
+	if a.leveraged.Load() {
+		return nil
+	}
+	ids := make([]string, 0, len(a.byID))
+	for id, entry := range a.byID {
+		if entry.Leverage > 0 {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		entry := a.byID[id]
+		err := a.invoke(ctx, func() error {
+			if _, e := a.exchange.SetLeverage(float64(entry.Leverage), entry.Symbol, a.params(ctx)); e != nil {
+				return e
+			}
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("execution: set venue leverage %d for %s: %w", entry.Leverage, id, err)
+		}
+	}
+	a.leveraged.Store(true)
+	return nil
 }
 
 // BindStore breaks the shared-service bootstrap cycle without opening a second
@@ -202,6 +253,10 @@ func (a *BanexgAdapter) Submit(ctx context.Context, intent OrderIntent, clientID
 	if intent.Instrument.Valuation != "linear_perpetual" {
 		return SubmitReceipt{}, errors.New("execution: live banexg rejects cash options")
 	}
+	if !a.leveraged.Load() {
+		// The host must apply declared leverage before publishing the account.
+		return SubmitReceipt{}, errors.New("execution: declared venue leverage has not been applied")
+	}
 	entry, ok := a.byID[intent.Instrument.ID]
 	if !ok {
 		return SubmitReceipt{}, errors.New("execution: unmapped banexg instrument")
@@ -271,7 +326,15 @@ func (a *BanexgAdapter) storedIdentity(ctx context.Context, clientID, exchangeID
 	if err != nil {
 		return order, err
 	}
-	if clientID != "" && clientID != order.ClientID || exchangeID != "" && exchangeID != order.ExchangeID {
+	// A private stream report can outrun the submit receipt: an instantly filled
+	// order is reported with its exchange ID before the receipt records it. A
+	// matching client ID with no recorded exchange ID is then the same order;
+	// the report is only a wake-up and recovery queries the venue for the
+	// authoritative state. Two different recorded exchange IDs still conflict.
+	if clientID != "" && clientID != order.ClientID || exchangeID != "" && order.ExchangeID != "" && exchangeID != order.ExchangeID {
+		return order, errors.New("execution: conflicting banexg order identity")
+	}
+	if exchangeID != "" && order.ExchangeID == "" && (clientID == "" || clientID != order.ClientID) {
 		return order, errors.New("execution: conflicting banexg order identity")
 	}
 	return order, nil
@@ -739,7 +802,12 @@ func (a *BanexgAdapter) Observe(ctx context.Context, instrumentID string) (Visib
 		return VisibleQuote{}, err
 	}
 	received := time.Now().UnixMilli()
-	if book == nil || book.Symbol != entry.Symbol || book.Bids == nil || book.Asks == nil || len(book.Bids.Price) == 0 || len(book.Asks.Price) == 0 || book.TimeStamp <= 0 || book.TimeStamp > received || received-book.TimeStamp >= a.config.QuoteTTL.Milliseconds() {
+	var observed int64
+	fresh := false
+	if book != nil {
+		observed, fresh = observedBookMS(book.TimeStamp, received, a.config.QuoteTTL)
+	}
+	if book == nil || book.Symbol != entry.Symbol || book.Bids == nil || book.Asks == nil || len(book.Bids.Price) == 0 || len(book.Asks.Price) == 0 || !fresh {
 		return VisibleQuote{}, errors.New("execution: incomplete banexg bid/ask quote")
 	}
 	bid, err := decimalBoundary(book.Bids.Price[0])
@@ -753,5 +821,5 @@ func (a *BanexgAdapter) Observe(ctx context.Context, instrumentID string) (Visib
 	if !bid.IsPositive() || ask.LessThan(bid) {
 		return VisibleQuote{}, errors.New("execution: invalid banexg bid/ask spread")
 	}
-	return VisibleQuote{Bid: bid, Ask: ask, AtMS: book.TimeStamp, ReceivedMS: received, ValidUntilMS: book.TimeStamp + a.config.QuoteTTL.Milliseconds()}, nil
+	return VisibleQuote{Bid: bid, Ask: ask, AtMS: observed, ReceivedMS: received, ValidUntilMS: observed + a.config.QuoteTTL.Milliseconds()}, nil
 }

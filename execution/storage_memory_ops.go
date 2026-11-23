@@ -514,7 +514,7 @@ func (tx *storeTxn) memoryRead(operation storageOperation, args []any) ([][]any,
 		var total int64
 		for _, kind := range []recordKind{recordsPlan, recordsLot, recordsPosition, recordsStrategy, recordsEvent, recordsCheckpoint, recordsExternalPosition} {
 			for _, r := range tx.selectRecords(kind, func(r memoryRecord) bool { return r.Account == argString(args[0]) }) {
-				if r.Account == argString(args[0]) && !(kind == recordsCheckpoint && (r.Kind != "strategy" || r.Strategy == "account-risk" && r.Name == "policy-v1")) {
+				if r.Account == argString(args[0]) && !(kind == recordsCheckpoint && (r.Kind != "strategy" || r.Strategy == "account-risk")) {
 					total++
 				}
 			}

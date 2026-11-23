@@ -359,20 +359,6 @@ func (p OHLCProfile) MatchProtection(bar *orm.SeriesOHLCV, short bool, sl, tp *O
 	return fill
 }
 
-// LegacyOrderFee uses normalized SDK interfaces for every market type and
-// normalizes the order type before SDK IO, including when fee calculation fails.
-func LegacyOrderFee(exchange banexg.BanExchange, symbol string, orderType *string, side string, filled, price float64) (*banexg.Fee, *errs.Error) {
-	maker := strings.Contains(*orderType, "limit")
-	if *orderType == banexg.OdTypeLimit {
-		if maker {
-			*orderType = banexg.OdTypeLimitMaker
-		} else {
-			*orderType = "limit_taker"
-		}
-	}
-	return exchange.CalculateFee(symbol, *orderType, side, filled, price, maker, nil)
-}
-
 // Entry helpers preserve SDK precision for spot/inverse/significant-digit
 // markets without imposing the quote profile's linear-perpetual lattice.
 func OHLCEntryPrice(exchange banexg.BanExchange, symbol string, price float64) (*banexg.Market, float64, *errs.Error) {

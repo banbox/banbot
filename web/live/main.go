@@ -243,3 +243,10 @@ func (s *apiServer) PublishSeries(msg *data.SeriesMsg) {
 		s.hub.Publish(msg)
 	}
 }
+
+// RegisterBotAPI mounts the account dashboard routes of one runtime on router
+// without authentication. The caller owns access control; StartApiWithRuntimeDeps
+// is the authenticated server used by robots.
+func RegisterBotAPI(router fiber.Router, deps biz.RuntimeDeps) {
+	newAPIHandlers(&deps).regApiBiz(router)
+}

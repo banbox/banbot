@@ -49,12 +49,12 @@ name: local  # Bot name, used to distinguish different bots in message notificat
 env: dry_run  # Field reference; see live environment/market restrictions below this template
 leverage: 2  # Leverage ratio, only valid in the futures market
 limit_vol_secs: 5  # The expiration time for the order book price based on trading volume, in seconds, default is 10
-put_limit_secs: 120  # Expected fill horizon for submitting limit orders, seconds; runtime default is 180
+put_limit_secs: 120  # Expected fill horizon for submitting limit orders, seconds; runtime default is 180 (ignored on the execution live path)
 account_pull_secs: 60  # The interval in seconds for regularly updating account balance and positions, default is 60 seconds.
 market_type: spot  # Market type: spot for spot trading, linear for USDT-margined contracts, inverse for coin-margined contracts, option for options contracts
 extra_markets: [spot]  # Additional market types admitted on the same exchange: spot/linear/inverse/margin/option; entries equal to market_type are ignored; off by default
 contract_type: swap  # swap for perpetual contracts, future for expiring contracts
-odbook_ttl: 1000  # Order book expiration time, in milliseconds, default is 500
+odbook_ttl: 1000  # Order book expiration time, in milliseconds, default is 500 (ignored on the execution live path)
 concur_num: 2  # Concurrent number of symbol candle downloads, default is 2 symbols
 order_type: market  # Order type: market for market orders, limit for limit orders
 stop_enter_bars: 20  # Cancel the limit entry order if it is not filled within this many candles, default is 0 (disabled)
@@ -254,7 +254,7 @@ mail:  # Email notification configuration
   port: 465  # SMTP port (usually 465 or 587)
   username: user1@example.com  # Email username
   password: your_password  # Email password or app password
-bt_in_live:  # Live trading scheduled backtest comparison feature
+bt_in_live:  # Live trading scheduled backtest comparison feature (removed; only a warning is logged when set)
   cron: "0 0 0 * * *"  # Cron expression, execute at 0:00 daily
   account: "account1"  # Specify the account to execute backtest
   mail_to:  # Email notification recipient list
@@ -289,7 +289,7 @@ llm_models:  # LLM model configs keyed by model name; called explicitly by strat
 
 ```
 
-The block above is a field reference, not a runnable live configuration. Default Hub live entry does not support `market_type: spot`, `env: test`, or inverse contracts. Ordinary `trade`, including pure time-series, uses the shared Hub and requires `prod` / `dry_run` linear perpetuals plus complete account execution declarations. Legacy `fatal_stop` and dynamic leverage settings are unsupported on this default path. Changing only `env: prod` does not make this template runnable. Follow [shared accounts and Hub](./execution.md) for instruments, funding, risk, store, sender leases, and accounts, then start Hub first.
+The block above is a field reference, not a runnable live configuration. Default Hub live entry does not support `market_type: spot`, `env: test`, or inverse contracts. Ordinary `trade`, including pure time-series, uses the shared Hub and requires `prod` / `dry_run` linear perpetuals plus complete account execution declarations. Changing only `env: prod` does not make this template runnable. Follow [shared accounts and Hub](./execution.md) for instruments, funding, risk, store, sender leases, and accounts, then start Hub first.
 
 
 ## Important details configuration
@@ -305,7 +305,17 @@ If you need to use different transaction amounts for different accounts, you can
 Set per-policy sizing multipliers with `run_policy[].stake_rate`.
 
 #### Global stop loss
-On the legacy time-series path, `fatal_stop` pauses entries for `fatal_stop_hours` when combined loss reaches the threshold within x minutes. Default Hub live execution rejects this mechanism; use the account risk declarations supported by the [execution guide](./execution.md).
+`fatal_stop` pauses entries for `fatal_stop_hours` when the account loss rate over the last x minutes reaches the threshold. On the default Hub live path the account owner enforces it: the loss rate is the drop of account equity within the window, and equity includes realized results, fees, funding and the floating result of open positions, so an unrealized loss also trips it. The pause is stored in the account ledger and holds across robot restarts and for every robot sharing the account. Only new entries are paused; exits and protection are unaffected. Robots sharing an account should use the same `fatal_stop`. Backtests do not apply it.
+
+On the default Hub live path `leverage` (account level overrides the root value; a whole number from 1 to 125) is the fixed leverage of every instrument of that account. It is declared with the account registration and set at the venue per instrument by the Hub account owner when the account comes online; if the venue refuses, the account does not come online. It only sets the venue margin multiple and does not scale order notional; `execution.margin_rate >= 1/leverage` is required. A per-order `Leverage` in a strategy request is still rejected. Leverage is part of the account registration, so changing it follows the account configuration change procedure. Embedded execution providers do not support declared leverage.
+
+#### Keys with no effect on the default Hub live path
+The default prod / dry-run path (shared account and Hub) does not run the legacy wallet and pair-rotation machinery. These keys are accepted but ignored; startup logs one warning per key whose value you changed (zero values and defaults are not reported):
+
+- `pairlists`: reported only when no static `pairs` is set (root or any `run_policy`) or `pairmgr.force_filters` is on; pairs are fixed at startup and must be listed in the configuration.
+- `pairmgr.cron` (periodic pair refresh and rotation does not run), `min_open_rate` (other than 0.5), `charge_on_bomb`, `margin_add_rate` (other than 0.66), `put_limit_secs` (other than 180), `odbook_ttl` (other than 500), `account_pull_secs` (other than 60), and `bt_in_live` (with a `cron`).
+
+Related: live `env: test` (testnet) and spot/margin/inverse markets are refused at startup; `--out` (kline/API dump) is rejected on this path with an error, and a strategy's dynamic `UpdatePairs` returns `pair updates are not available in this runtime`.
 
 #### Environment
 The optional values for `env` are:
@@ -440,6 +450,8 @@ Configuration keeps the v0.5 root keys and run_policy list without requiring con
 | run_policy[].universe / rolling_universe (also under portfolio) | mode: rolling_liquid_top/liquid_top/static, top_n, lookback_days, lookback_bars, min_listing_days, min_age_bars, reconstitute_days, reconstitute_bars, schedule: daily/weekly/monthly, always_include |
 | run_policy[].research | labels, label_wait_ms, panel (all/none) |
 | run_policy[].prices | source, timeframe, field |
+
+An embedded production time-series account (`env: prod` with a custom `live_provider`) always uses the in-process Hub order manager; the former `ts_facade` key was removed and is rejected at load time (delete it). See [Execution](./execution.md).
 
 accounts.&lt;account&gt; overrides account settings; margin and gross risk limits are ratio constraints; choose values for the execution mode and account NAV. archive/store/history/sender_lease_dir follow the field's originating file, including multi-file overrides. Latest-value storage needs static-approximation. page_bytes bounds logical payload, not RSS. See [factor examples](./factor.md).
 

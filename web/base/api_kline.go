@@ -139,9 +139,10 @@ func (h klineHandlers) getSeries(c *fiber.Ctx) error {
 			return err
 		}
 	} else {
-		rows, err = h.seriesStore().Read(h.context(), info, target, args.StartMS, args.EndMS, args.Limit)
-		if err != nil {
-			return err
+		var readErr *errs.Error
+		rows, readErr = h.seriesStore().Read(h.context(), info, target, args.StartMS, args.EndMS, args.Limit)
+		if readErr != nil {
+			return readErr
 		}
 	}
 	return c.JSON(fiber.Map{

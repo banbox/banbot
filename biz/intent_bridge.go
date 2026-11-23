@@ -71,6 +71,11 @@ func (c IntentBridgeContext) intent(kind execution.IntentKind, side execution.Or
 // BridgeEntryReq accepts market/limit semantics. Unsupported order styles are
 // errors, not silently downgraded. StopLoss/TakeProfit/Trailing on EnterReq are
 // post-entry protections, preserved explicitly for the later owner adapter.
+// errEntrySizeRejected marks a request whose size cannot be traded: it rounds
+// to no quantity step or exceeds the strategy's notional allowance. It says
+// nothing about the account, so a manager may drop the request and continue.
+var errEntrySizeRejected = errors.New("biz: entry quantity below step or above risk allowance")
+
 func BridgeEntryReq(c IntentBridgeContext, req *strat.EnterReq) (*EntryIntentBridge, error) {
 	if req == nil {
 		return nil, errors.New("biz: nil entry request")
@@ -139,7 +144,7 @@ func BridgeEntryReq(c IntentBridgeContext, req *strat.EnterReq) (*EntryIntentBri
 		return nil, err
 	}
 	if steps <= 0 || unitNotional.Mul(decimal.NewFromInt(steps)).GreaterThan(c.MaxNotional) {
-		return nil, errors.New("biz: entry quantity below step or above risk allowance")
+		return nil, errEntrySizeRejected
 	}
 	side := execution.Buy
 	if req.Short {

@@ -39,8 +39,9 @@ equivalent execution-owned implementation and regression coverage. Removing a
 legacy constructor, rejecting its configuration, or changing a native stop into
 a software stop does not establish parity.
 
-The existing `SharedOrderMgr` is a strategy-facing request/projection adapter.
-It does not send SDK orders. The execution account owner owns submission,
+`SharedOrderMgr` is the backtest-only strategy-facing request/projection adapter
+(mixed factor + time-series replay); live and dry-run accounts, including the
+time-series part of a mixed account, use `HubOrderMgr`. It does not send SDK orders. The execution account owner owns submission,
 stable client IDs, durable attempts, fills, balances and reconciliation.
 Pending entries, exits, protection checkpoints and placement policy now live in
 `execution/pending_*.go`. The account-owned registry is committed atomically with
@@ -99,7 +100,9 @@ does not imply that an unverified live venue is enabled.
 Production legacy manager construction and unconfigured production TS startup
 are now disabled. Unsupported scenarios fail explicitly instead of falling back
 to the retired sender. This safety fence does not mean those scenarios have
-been migrated. Offline legacy code/tests remain as the compatibility specification.
+been migrated. The retired legacy live order manager (`LiveOrderMgr`,
+`LocalLiveOrderMgr`) has been deleted; the supported/refused/ignored matrix and
+the migration notes per feature are in `doc/project/05_biz_orders_live.md`.
 
 ## Scenario acceptance matrix
 
@@ -119,7 +122,7 @@ been migrated. Offline legacy code/tests remain as the compatibility specificati
 | CLI close of attributed strategy orders | `runtime/shared_close_tool_test.go`, `live/tools_test.go` | Shared owner cancellation/reduction; no raw account-wide SDK cancellation |
 | Native fixed SL/TP lifecycle | `execution/conditional_test.go`, `execution/pending_native_test.go` | Capability-gated core; pinned SDK falls back visibly; trailing anchor recovery remains unsupported |
 | Spot, inverse, dated and hedge-mode venue positions | Adapter/instrument validation currently rejects these | Not migrated; do not reinterpret as net linear positions |
-| Dynamic leverage, venue leverage caps and proportional resizing | Old `LiveOrderMgr.submitExgOrder` | Not migrated; must run before durable allocation sizing |
+| Leverage | `execution/banexg_leverage_test.go`, `entry/hub_test.go`, `entry/time_series_execution_test.go` | Fixed per-instrument leverage declared at account registration and set at the venue by the Hub owner before any order; requires `margin_rate >= 1/leverage`. Per-order leverage, venue leverage caps by notional tier and proportional resizing are not migrated and stay rejected. Real-venue acceptance of the SetLeverage call is still required |
 | Order-book/volume-based default limit selection | `execution/limit_price_test.go`, `execution/banexg_limit_price_test.go`, `runtime/shared_order_mode_test.go` | Production SDK binding uses closed-minute volume, current depth and tick rounding; missing liquidity fails closed |
 | Default local / isolated exchange-first limits | `runtime/shared_order_mode_test.go`, `execution/pending_revocation_test.go` | Account-scoped admission and cancel/final-fill transitions, including factor arrivals |
 | Account-owned pending execution after restart | `execution/pending_registry_test.go` | Durable source state, entry/protection execution without biz callbacks |
@@ -129,8 +132,14 @@ been migrated. Offline legacy code/tests remain as the compatibility specificati
 | Serializable TS projection and callback delivery | `execution/time_series_projection_test.go`, `biz/time_series_projection_test.go` | Local/remote page parity, terminal metadata, replay/ack and multi-lot callback failures; full legacy order-view/event-time conversion remains pending |
 | Private balance and zero-fill status wakeups | `execution/private_balance_stream_test.go` | Capability-gated balance subscription, authoritative accounting, closure/setup cancellation and failure freezes; independent normalized order stream still unavailable in pinned SDK |
 | Explicit external book takeover | `execution/external_attribution_test.go` | Atomic attributed inventory/economics transfer; requires an explicit destination and subsequent reconciliation |
-| Automatic external trade discovery and takeover | `execution/banexg_external_test.go`, `execution/auto_takeover_test.go`, `biz/shared_takeover_test.go` | Configured `take_over_strat`; only complete terminal-order trade history and provable opening/additions enter fresh lots; unknown active orders, ambiguous reductions and missing basis remain frozen |
-| Fatal-stop loss windows | Old wallet/order-history data sources | Ledger-backed equivalent still required |
+| Automatic external trade discovery and takeover | `execution/banexg_external_test.go`, `execution/auto_takeover_test.go`, `runtime/hub_takeover_test.go` | Configured `take_over_strat`; only complete terminal-order trade history and provable opening/additions enter fresh lots; unknown active orders, ambiguous reductions and missing basis remain frozen |
+| Take-profit ladders and OCO entry groups on the Hub path | `runtime/hub_ladder_oco_test.go`, `runtime/hub_ladder_review_test.go`, `biz/hub_order_ladder_test.go`, `biz/hub_order_ladder_review_test.go` | Robot-side orchestration over existing owner commands (`set_protections`, `cancel_entry`) with journaled `Plans`/`Followups`, retry/abandon/back-off, tiny-rung merging and break-even reconciliation. The owner itself resolves OCO groups before coordination (`execution/pending_oco.go`, `runtime/hub_oco_owner_test.go`): of several members executable in the same tick only the earliest-created survives (`oco_simultaneous`), and once a member has a fill its open unfilled siblings are cancelled (`oco_filled_sibling`); members with fills, live orders, reservations or exits are never cancelled (several filled members all stay, with a WARN). Known differences from in-process `SharedOrderMgr`: `set_protections` resets the owner's trailing anchor; `Val`/`Rate` rungs are exact only after the entry fill is observed; a ladder or stop exit carries no rung exit tag in the Hub view |
+| Owner refusals of new entries on the Hub path (price tick, risk budget, spot short, self-cross, venue minimum) | `execution/hub_rejection_test.go`, `runtime/hub_rejection_test.go` | The owner returns a closed fixed code only for `create`; the robot drops the entry with a warning, keeps running and does not consume the bar's open-order capacity. Exits, edits and protection changes stay fail-closed. Order prices are tick-checked at admission; trigger levels are not |
+| Opposite deltas of one strategy and refusal isolation in the autonomous tick | `execution/pending_sequence_test.go`, `execution/pending_isolation_test.go` | Reductions execute and the opposite increase waits one tick; an admitted, increasing, not-yet-working entry refused deterministically is canceled (audited) instead of freezing the account. Embedded `SharedOrderMgr` entries are not admitted by the owner and are not isolated |
+| Account metrics of factor-only Hub robots and time-series Hub robots | `runtime/hub_account_reader_test.go` | Read-only cached view (1 s TTL, 3 s timeout); metrics inside sub-second callbacks may be up to 1 s old |
+| Fill and status notifications, batch callbacks, strategy shutdown hooks | `runtime/order_notify_test.go`, `runtime/live_hooks_test.go` | Execution-backed runtimes: asynchronous bounded notification queue (drop on overflow), batch firing after `core.DelayBatchMS`, `OnShutDown`/`OnStratExit` at shutdown; per-order `strat_perf` score updates run in `runtime/perf_update.go` (`runtime/perf_update_test.go`): bounded per-job ring of `max_od_num` closed orders, deduplicated by lot, seeded from archived rows on the Hub path only (`SharedOrderMgr` does not archive, so its ring starts empty after a restart), `strat_perfs.yml` dumped in live mode, inert when `strat_perf` is disabled |
+| Hub-facing facade for an embedded production time-series robot (the only facade; the former `execution.ts_facade` key was removed) | `execution/hub_port_test.go`, `execution/hub_error_observer_test.go`, `runtime/hub_port_parity_test.go`, `runtime/embedded_hub_facade_test.go`, `entry/ts_facade_test.go` | `HubOrderMgr` over an in-process `LocalHubPort` (same JSON round trip, error mapping and size limits as the socket) onto the robot's own `SharedAccount` through `EmbeddedHub`; used by every prod embedded time-series account with a custom `live_provider`; `ts_facade` is rejected at config load (`entry/ts_facade_test.go`) and `SharedOrderMgr` is no longer built for that path (`entry/ts_facade_default_test.go`); the first start without a journal imports the `__legacy_bridge` checkpoint once and leaves the legacy data untouched (`biz/hub_order_legacy_import.go`, `runtime/hub_legacy_migration_test.go`); `take_over_strat` is supported; journal `execution/robots/ts-local-<hash>.json` |
+| Fatal-stop loss windows | `execution/loss_stop_test.go`, `biz/ts_loss_stop_test.go` | Account-owned equity loss breaker (`LossStopPolicy`): realized results, fees, funding and floating losses count; durable pause shared by all robots; robot-side admission enforces it before a command is frozen. Measured on equity change, not on closed-order profit, so values differ from the legacy cron |
 
 ## Cutover safety
 

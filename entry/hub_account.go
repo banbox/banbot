@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -75,6 +76,15 @@ func decodeHubAccountConfig(request execution.HubAccountRegistration) (HubAccoun
 	}
 	if !c.Risk.MarginRate.IsPositive() || c.Risk.MarginRate.GreaterThan(decimal.NewFromInt(1)) || !c.Risk.MaxAccountMargin.IsPositive() || !c.Risk.MaxVirtualGross.IsPositive() || len(c.Risk.StrategyGrossLimits) != len(c.Capital) {
 		return c, errors.New("hub: explicit positive account and strategy risk limits required")
+	}
+	for _, unit := range c.Instruments {
+		if unit.Leverage < 0 || unit.Leverage > 125 {
+			return c, errors.New("hub: declared instrument leverage must be between 1 and 125")
+		}
+		// Account margin accounting must be at least as conservative as the venue.
+		if unit.Leverage > 0 && c.Risk.MarginRate.Mul(decimal.NewFromInt(int64(unit.Leverage))).LessThan(decimal.NewFromInt(1)) {
+			return c, fmt.Errorf("hub: instrument %s leverage %d requires margin_rate >= 1/%d", unit.Instrument.ID, unit.Leverage, unit.Leverage)
+		}
 	}
 	for id, capital := range c.Capital {
 		if id == "" || !capital.IsPositive() || !c.Risk.StrategyGrossLimits[id].IsPositive() {
@@ -149,6 +159,9 @@ func newHubAccountFactory(root, leaseDir string, netDisabled bool) execution.Hub
 				return binding, errors.New("hub: declared instrument disagrees with normalized exchange metadata")
 			}
 		}
+		if err := verifyHubProductionAccount(exchange, request, c.Credential, c.Exchange); err != nil {
+			return binding, err
+		}
 		owner, err := registry.Acquire(request.Account)
 		if err != nil {
 			return binding, err
@@ -192,6 +205,11 @@ func newHubAccountFactory(root, leaseDir string, netDisabled bool) execution.Hub
 		}
 		if err := borrow.RecoverPersisted(ctx); err != nil {
 			return binding, err
+		}
+		if live, ok := adapter.(*execution.BanexgAdapter); ok {
+			if err := live.ApplyLeverage(ctx); err != nil {
+				return binding, err
+			}
 		}
 		if live, ok := adapter.(*execution.BanexgAdapter); ok {
 			if err := live.RecoverCash(ctx, borrow); err != nil {

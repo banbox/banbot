@@ -85,7 +85,6 @@ func Coordinate(snapshot AccountSnapshot, targets []ExecutableTarget, instrument
 	for id, cash := range snapshot.SyntheticStrategyCash {
 		strategyNAV[id] = cash
 	}
-	otherGross := make(map[StrategyID]decimal.Decimal)
 	for _, lot := range snapshot.Lots {
 		mark, ok := marks[lot.Instrument.ID]
 		if !ok || !lot.Instrument.ValidMark(mark) {
@@ -96,15 +95,13 @@ func Coordinate(snapshot AccountSnapshot, targets []ExecutableTarget, instrument
 			key := lotKey{lot.Strategy, lot.ID}
 			projected[key] = lot.SignedSteps
 			original[key] = lot.SignedSteps
-		} else {
-			otherGross[lot.Strategy] = otherGross[lot.Strategy].Add(lot.Instrument.RiskGross(lot.SignedSteps, mark))
 		}
 	}
 	projectedLots, projectedPositions, err := confirmedExposure(snapshot)
 	if err != nil {
 		return result, err
 	}
-	otherGross = make(map[StrategyID]decimal.Decimal)
+	otherGross := make(map[StrategyID]decimal.Decimal)
 	for _, lot := range projectedLots {
 		if lot.Instrument.ID != instrument.ID {
 			mark, ok := marks[lot.Instrument.ID]
@@ -194,7 +191,7 @@ func Coordinate(snapshot AccountSnapshot, targets []ExecutableTarget, instrument
 			return result, errors.New("execution: invalid/duplicate executable target")
 		}
 		if !instrument.ShortAllowed() && target.SignedSteps < 0 {
-			return result, errors.New("execution: short positions are not allowed on spot instrument")
+			return result, rejectedAt(RejectSpotShort, "execution: short positions are not allowed on spot instrument", rejectionScope{Strategy: target.Strategy, Lot: target.Lot, Instrument: instrument.ID})
 		}
 		seen[key] = true
 		result.DesiredSteps, err = checkedSteps(result.DesiredSteps, target.SignedSteps)
@@ -241,19 +238,19 @@ func Coordinate(snapshot AccountSnapshot, targets []ExecutableTarget, instrument
 		}
 		previousTotalGross = previousTotalGross.Add(previous)
 		if gross.GreaterThan(previous) && gross.GreaterThan(limit) {
-			return result, errors.New("execution: strategy gross budget exceeded")
+			return result, rejectedAt(RejectRiskLimit, "execution: strategy gross budget exceeded", rejectionScope{Strategy: strategy, Instrument: instrument.ID})
 		}
 		if strategyCollateral[strategy].GreaterThan(previousCollateral[strategy]) && strategyCollateral[strategy].GreaterThan(strategyNAV[strategy]) {
-			return result, errors.New("execution: strategy NAV margin budget exceeded")
+			return result, rejectedAt(RejectRiskLimit, "execution: strategy NAV margin budget exceeded", rejectionScope{Strategy: strategy, Instrument: instrument.ID})
 		}
 	}
 	if result.VirtualGross.GreaterThan(previousTotalGross) && result.VirtualGross.GreaterThan(risk.MaxVirtualGross) {
-		return result, errors.New("execution: virtual gross exposure limit exceeded")
+		return result, rejected(RejectRiskLimit, "execution: virtual gross exposure limit exceeded")
 	}
 	result.AccountMargin = instrument.Collateral(result.DesiredSteps, observation.Price, risk.MarginRate).Add(otherMargin)
 	currentMargin := instrument.Collateral(result.ProjectedSteps, observation.Price, risk.MarginRate).Add(otherMargin)
 	if result.AccountMargin.GreaterThan(currentMargin) && (result.AccountMargin.GreaterThan(risk.MaxAccountMargin) || result.AccountMargin.GreaterThan(equity)) {
-		return result, errors.New("execution: actual net margin allowance exceeded")
+		return result, rejected(RejectRiskLimit, "execution: actual net margin allowance exceeded")
 	}
 	delta, err := checkedSteps(result.DesiredSteps, -result.ProjectedSteps)
 	if err != nil {

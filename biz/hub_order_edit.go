@@ -7,6 +7,7 @@ import (
 	"github.com/banbox/banbot/execution"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/shopspring/decimal"
+	"go.uber.org/zap"
 )
 
 func (m *HubOrderMgr) EditOrder(od *ormo.InOutOrder, action string) {
@@ -17,6 +18,9 @@ func (m *HubOrderMgr) EditOrder(od *ormo.InOutOrder, action string) {
 	m.started = true
 	err := m.editLocked(od, action)
 	m.mu.Unlock()
+	if errors.Is(err, errSharedEntryRejected) {
+		return
+	}
 	if err == nil {
 		err = m.poll(false)
 	}
@@ -53,6 +57,13 @@ func (m *HubOrderMgr) editLocked(od *ormo.InOutOrder, action string) error {
 	if p == nil {
 		return errors.New("biz: Hub edit pending definition missing")
 	}
+	plan := m.journal.Plans[key]
+	if plan != nil && plan.Ladder != nil && action == ormo.OdInfoTakeProfit {
+		// The ladder owns the lot's take-profit; a single-level edit would
+		// silently replace the remaining rungs.
+		m.deps.Logger().Warn("take-profit edit rejected: the lot has a take-profit ladder", zap.Int64("order_id", od.ID))
+		return errSharedEntryRejected
+	}
 	id, epoch, seq, err := m.nextLocked(b.ID)
 	if err != nil {
 		return err
@@ -68,14 +79,14 @@ func (m *HubOrderMgr) editLocked(od *ormo.InOutOrder, action string) error {
 			return errors.New("biz: missing edited Hub entry price")
 		}
 		command.Action = execution.PendingEditLimit
-		command.Limit = decimal.NewFromFloat(od.Enter.Price)
+		command.Limit = decimal.NewFromFloat(roundToTick(od.Enter.Price, m.config.Bridge.Instruments[od.Symbol].PriceTick))
 		payload.Request.Limit = od.Enter.Price
 	case ormo.OdActionLimitExit:
 		if od.Exit == nil || od.Exit.Price <= 0 {
 			return errors.New("biz: missing edited Hub exit price")
 		}
 		command.Action = execution.PendingEditExitLimit
-		command.Limit = decimal.NewFromFloat(od.Exit.Price)
+		command.Limit = decimal.NewFromFloat(roundToTick(od.Exit.Price, m.config.Bridge.Instruments[od.Symbol].PriceTick))
 	case ormo.OdInfoStopLoss:
 		payload.Request.StopLossVal = 0
 		payload.Request.StopLoss, payload.Request.StopLossLimit, payload.Request.StopLossRate, payload.Request.StopLossTag = 0, 0, 0, ""
@@ -102,6 +113,26 @@ func (m *HubOrderMgr) editLocked(od *ormo.InOutOrder, action string) error {
 	}
 	if command.Action == execution.PendingSetProtections {
 		command.Protections = sharedProtectionSpecs(payload.Request)
+		if plan != nil && plan.Ladder != nil {
+			// set_protections replaces the whole set: keep the ladder's active
+			// rung (never the single TakeProfit fields) and settle a finished
+			// rung first so it is not re-armed.
+			snap, e := m.config.Client.Snapshot(m.ctx, m.config.Account)
+			if e != nil {
+				return e
+			}
+			var held int64
+			for _, l := range snap.Lots {
+				if l.Strategy == b.ID && string(l.ID) == lotID {
+					held = l.SignedSteps
+				}
+			}
+			next, _ := m.ladderStep(*plan.Ladder, lot, *p, held)
+			command.Protections = m.ladderSpecs(next, command.Protections, nil, m.lotAverage(lot))
+			// BEPending is deliberately kept: the owner may refuse this command (it is
+			// then dropped), so ladderStep clears it once the owner's stop is tight.
+			*plan.Ladder = next
+		}
 	}
 	metadata := lot.Record.Metadata
 	metadata.Payload, err = json.Marshal(payload)

@@ -562,7 +562,7 @@ type EnterReq struct {
 	Log             bool // Whether to automatically log error messages
 }
 ```
-To trigger an entry at a specific price, you can set the `Limit` or `Stop` parameters.
+To trigger an entry at a specific price, you can set the `Limit` or `Stop` parameters. On the default prod / dry-run shared-account (Hub) path, order prices (`Limit`, `StopLossLimit`, `TakeProfitLimit`, the `Limit` of a take-profit stage, and the `Limit` of exit requests and edited orders) are rounded to the instrument's price tick before submission; trigger prices (`Stop`, `StopLoss`, `TakeProfit`, stage `Price`) are not rounded.
 
 `Limit` would put a limit order. For a long order, you can set a lower price to enter the position. For a short order, you can set a higher price to enter the position.
 
@@ -593,6 +593,8 @@ The result is capped by leverage (1x for spot) and the account's `max_stake_amt`
 | `AccountEquity() float64` | Account equity (balance + unrealized PnL, in the pricing currency); during warmup or before the wallet is ready it falls back to the initial capital / default stake amount, and never returns 0 or NaN |
 | `AvailableBalance() float64` | Available balance / margin; 0 when unavailable |
 | `AccountDrawdown() float64` | Drawdown ratio versus the equity peak since the run started, in `[0,1]`; 0 during warmup. Shared by all symbols of the account |
+
+On Hub-path robots these account metrics share a cache of up to 1 second: inside sub-second callbacks such as `OnTick`, `AccountEquity()` and the other methods may be up to 1 second old; bar callbacks of 1 minute or longer are not affected.
 
 ```go
 Main: func(s *strat.StratJob, _ strat.DataEvent) {
@@ -720,6 +722,8 @@ _ = s.OpenOrder(&strat.EnterReq{Tag: "trail", StopLossVal: atr * 2, ActivationPr
 | `Tag` | Exit reason for this stage |
 
 Stages trigger from nearest to farthest from the entry price, and cannot be combined with `TakeProfit`, `TakeProfitVal` or `TakeProfitLimit`; once `TakeProfits` is set, `LongTPPrice/ShortTPPrice` no longer apply.
+
+Under the default prod / dry-run shared-account (Hub) path the ladder is driven by the robot: the first stage is the position's take-profit, and each next stage is installed after the previous one is reported as executed (seen on the robot's next poll, so it can lag slightly). A non-final stage smaller than one quantity step is merged into the next stage. `Val`/`Rate` stages are estimated from the reference price (`Limit`, else `Stop`, else the mid price) and recomputed from the real average fill once the entry fill is observed. A stage that resolves to a non-positive price makes the entry be rejected, and a single-level `TakeProfit` edit of an order that has a ladder is rejected. Every stage change restarts trailing-stop tracking, and an exit by a stage or by the stop carries no per-stage exit tag in the order view.
 ```go
 _ = s.OpenOrder(&strat.EnterReq{
     Tag: "ladder", StopLossVal: atr * 2,
@@ -742,6 +746,8 @@ Give several pending entries the same `OCOGroup`; when one of them fills, the ot
 _ = s.OpenOrder(&strat.EnterReq{Tag: "brk_long", Stop: hi, Limit: hi + slip, OCOGroup: "donchian", StopBars: 2, StopLossVal: atr * 2})
 _ = s.OpenOrder(&strat.EnterReq{Tag: "brk_short", Short: true, Stop: lo, Limit: lo - slip, OCOGroup: "donchian", StopBars: 2, StopLossVal: atr * 2})
 ```
+On the default prod / dry-run shared-account (Hub) path the account execution service enforces OCO itself: when several members are executable in the same tick only the earliest-created one is kept and the others are cancelled; once a member of the group has a fill, the other still-open unfilled members are cancelled too. A member that already has a fill, a live exchange order, a reservation or an exit is never cancelled; if several members are filled they all stay and a warning is logged. The robot additionally sends a cancel after it observes a fill, and a member it cancels is reported with exit tag `oco_cancel`.
+
 Groups are identified by (symbol, strategy, `OCOGroup`) and are meant for pending entries (with `Stop` or `Limit` set). In backtests, pair it with `refine_tf` so the order in which the two sides trigger within one bar is judged more accurately. Pending entries occupy open-order slots, so `max_simul_open` must be large enough. See `bracket.go` in [banstrats/examples/tsfeatures](https://github.com/banbox/banstrats/tree/main/examples/tsfeatures) for a complete example.
 
 ## Batch task processing

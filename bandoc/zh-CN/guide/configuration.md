@@ -47,12 +47,12 @@ name: local  # 机器人名称，用于在消息通知中区分不同机器人
 env: dry_run  # 字段参考；默认实时入口的环境/市场限制见模板后的说明
 leverage: 2  # 杠杆倍数，仅期货合约市场有效
 limit_vol_secs: 5  # 按成交量取订单簿价格的过期时间，单位：秒，默认10
-put_limit_secs: 120  # 在此预期时间内能成交的限价单，才提交到交易所，单位：秒，默认180
+put_limit_secs: 120  # 在此预期时间内能成交的限价单，才提交到交易所，单位：秒，默认180（execution 实盘路径忽略）
 account_pull_secs: 60  # 定期更新账户余额和持仓的间隔秒数，默认60秒
 market_type: spot  # 市场：spot现货，linear：U本位合约，inverse：币本位合约，option：期权合约
 extra_markets: [spot]  # 同一交易所额外准入的市场类型，可选 spot/linear/inverse/margin/option；与 market_type 相同的项被忽略，默认不启用
 contract_type: swap # swap永续合约，future到期合约
-odbook_ttl: 1000  # 订单簿过期时间，单位毫秒，默认500
+odbook_ttl: 1000  # 订单簿过期时间，单位毫秒，默认500（execution 实盘路径忽略）
 concur_num: 2  # 标的K线并发下载数，默认2个标的
 order_type: market  # 下单类型：market市价单  limit限价单
 stop_enter_bars: 20  # 限价入场单超过多少个蜡烛未成交则取消入场，默认0不启用
@@ -252,7 +252,7 @@ mail:  # 邮件通知配置
   port: 465  # SMTP端口（通常为465或587）
   username: user1@example.com  # 邮箱用户名
   password: your_password  # 邮箱密码或应用密码
-bt_in_live:  # 实盘定时回测对比功能
+bt_in_live:  # 实盘定时回测对比功能（已删除，配置后仅告警）
   cron: "0 0 0 * * *"  # Cron表达式，每天0点执行
   account: "account1"  # 指定执行回测的账户
   mail_to:  # 邮件通知收件人列表
@@ -287,7 +287,7 @@ llm_models:  # LLM 模型配置，键为模型名；需由策略项目或工具�
 
 ```
 
-上方是字段参考，不是可启动的实时配置：`market_type: spot`、`env: test`、反向合约不受默认 Hub 实时入口支持。普通 `trade`（含纯时序）默认共享 Hub，只接受 `prod` / `dry_run` 的线性永续及完整账户执行声明。旧 `fatal_stop` 和动态 leverage 等配置不受该默认路径支持；切勿仅改 `env: prod` 就执行模板。先按[共享账户与 Hub](./execution.md)准备 instrument、资金费、风险、store、发送租约及账户配置，并先启动 Hub。
+上方是字段参考，不是可启动的实时配置：`market_type: spot`、`env: test`、反向合约不受默认 Hub 实时入口支持。普通 `trade`（含纯时序）默认共享 Hub，只接受 `prod` / `dry_run` 的线性永续及完整账户执行声明。切勿仅改 `env: prod` 就执行模板。先按[共享账户与 Hub](./execution.md)准备 instrument、资金费、风险、store、发送租约及账户配置，并先启动 Hub。
 
 
 ## 重要细节配置
@@ -303,7 +303,17 @@ llm_models:  # LLM 模型配置，键为模型名；需由策略项目或工具�
 同样，可通过 `run_policy[].stake_rate` 设置策略开单倍率。
 
 #### 全局止损
-旧时序路径的 `fatal_stop` 表示综合 x 分钟损失达到阈值时停止开仓 `fatal_stop_hours` 小时。默认 Hub 实时路径不接受此机制；请使用[执行指南](./execution.md)支持的账户风险声明。
+`fatal_stop` 表示账户在最近 x 分钟内的亏损率达到阈值时，停止开仓 `fatal_stop_hours` 小时。默认 Hub 实时路径由账户 owner 执行：亏损率 = 窗口内账户权益的回落比例，权益包含已实现盈亏、手续费、资金费和当前持仓的浮动盈亏，因此未平仓的浮亏同样会触发。暂停状态保存在账户账本中，机器人重启或多个机器人共用账户时都生效；只暂停新开仓，平仓与止损止盈不受影响。同一账户的多个机器人应使用相同的 `fatal_stop` 配置。回测不启用。
+
+默认 Hub 实时路径把 `leverage`（账户级优先于根级，须为 1–125 的整数）作为该账户全部品种的固定杠杆：随账户注册声明，由 Hub 账户 owner 上线时逐品种设置到交易所，设置失败则账户不上线。它只决定交易所侧的保证金倍数，不放大下单名义金额；要求 `execution.margin_rate >= 1/leverage`。策略请求里的逐单 `Leverage` 仍被拒绝。杠杆是账户注册内容的一部分，变更需按账户配置变更流程处理。内嵌 execution provider 不支持声明杠杆。
+
+#### 默认 Hub 实时路径上不生效的配置
+默认的 prod/dry-run 路径（共享账户与 Hub）不运行旧的钱包与选币轮动机制。下列键可以保留但不起作用；启动时对值被改动过的键各记一条告警（零值和默认值不报告）：
+
+- `pairlists`：仅当没有静态 `pairs`（根级或任一 `run_policy`）或开启 `pairmgr.force_filters` 时才报告；品种在启动时固定，须写在配置里。
+- `pairmgr.cron`（定期选币刷新与轮动不会运行）、`min_open_rate`（非 0.5 时）、`charge_on_bomb`、`margin_add_rate`（非 0.66 时）、`put_limit_secs`（非 180 时）、`odbook_ttl`（非 500 时）、`account_pull_secs`（非 60 时），以及 `bt_in_live`（设置了 `cron` 时）。
+
+相关：实盘 `env: test`（测试网）与 spot/margin/inverse 市场在启动时被拒绝；该路径拒绝 `--out`（K 线/API 转储）并报错；策略动态调用 `UpdatePairs` 会返回 `pair updates are not available in this runtime`。
 
 #### 运行环境
 `env`的可选值：
@@ -438,6 +448,8 @@ bt_in_live:
 | run_policy[].universe / rolling_universe (also under portfolio) | mode: rolling_liquid_top/liquid_top/static, top_n, lookback_days, lookback_bars, min_listing_days, min_age_bars, reconstitute_days, reconstitute_bars, schedule: daily/weekly/monthly, always_include |
 | run_policy[].research | labels, label_wait_ms, panel (all/none) |
 | run_policy[].prices | source, timeframe, field |
+
+内嵌生产时序账户（`env: prod` 且 `live_provider` 为自定义名）恒使用进程内 Hub 订单管理器；原 `ts_facade` 键已移除，配置它会在加载时报错（须删除）。详见[执行](./execution.md)。
 
 accounts.&lt;account&gt; 覆盖账户设置；保证金和 gross 风险额度为比例约束，具体取值应与执行模式及账户净值匹配。archive/store/history/sender_lease_dir 相对字段来源文件定位，多 --config 不以最后一文件统一定位。最新值存储需 static-approximation；page_bytes 是逻辑载荷，不是 RSS。见[因子示例](./factor.md)。
 

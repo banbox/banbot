@@ -444,6 +444,35 @@ func InitOdSubsWithRuntimeDeps(deps *RuntimeDeps) {
 	}
 }
 
+// applyHedgeOff closes the opposite side of a one-way strategy when an entry
+// fills. Execution-backed managers call it inside the callback's order-event
+// scope so the close requests get event-derived command IDs.
+func applyHedgeOff(job *strat.StratJob, od *ormo.InOutOrder, evt int) {
+	if job == nil || job.Strat == nil || od == nil || !job.Strat.HedgeOff || evt != strat.OdChgEnterFill {
+		return
+	}
+	closeSideOrders(job, !od.Short)
+}
+
+// flushCallbackOrders submits requests a strategy queued inside OnOrderChange
+// and finalises pair rotation, as the legacy subscription does. It must run
+// outside the manager mutex. A recursive call while the job's drain loop is
+// active returns immediately (BeginOrderProcessing) and the owner drains.
+func flushCallbackOrders(deps *RuntimeDeps, job *strat.StratJob, process func(*strat.StratJob) ([]*ormo.InOutOrder, []*ormo.InOutOrder, *errs.Error)) {
+	if job == nil || process == nil {
+		return
+	}
+	requests := job.ExecutionSnapshot()
+	if len(requests.Entrys) > 0 || len(requests.Exits) > 0 {
+		if _, _, err := process(job); err != nil {
+			log.Error("process orders fail", zap.Error(err))
+		}
+	}
+	if deps != nil && job.PairRemovalPending() {
+		strat.FinalizePairRotation(deps.Strategies, deps.Core)
+	}
+}
+
 func closeSideOrders(s *strat.StratJob, isShort bool) {
 	snapshot := s.ExecutionSnapshot()
 	var closeList = snapshot.LongOrders

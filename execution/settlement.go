@@ -129,7 +129,9 @@ func (s *Store) ApplyInternalMatch(ctx context.Context, match InternalMatch) (bo
 				sell = intent
 			}
 		}
-		if buy.Strategy == sell.Strategy {
+		// Same-strategy crossing is limited to two exits (the strategy closes its
+		// own opposite lots); each intent still settles its own lot.
+		if buy.Strategy == sell.Strategy && (buy.Kind != ExitIntent || sell.Kind != ExitIntent || buy.Lot == sell.Lot) {
 			return errors.New("execution: internal counterparties must be distinct strategies")
 		}
 		reclassified := decimal.Zero
@@ -418,6 +420,12 @@ type AccountReconciliation struct {
 	AtMS        int64
 }
 
+// ErrReconciliationCashMismatch: venue cash differs from the settled ledger
+// cash. The reconciliation committed nothing. The private report worker uses
+// it to fetch funding on demand (a settlement since the last fetch explains
+// the difference) and retries once before treating it as a failure.
+var ErrReconciliationCashMismatch = errors.New("execution: reconciliation settled cash mismatch")
+
 // Reconcile validates, rather than overwrites, the ledger against an
 // authoritative account snapshot. Unassigned open positions and uncertain
 // orders keep admission frozen; their attribution needs an explicit migration.
@@ -444,7 +452,7 @@ func (s *Store) Reconcile(ctx context.Context, event AccountReconciliation) (boo
 			return err
 		}
 		if !cash.Equal(event.AccountCash) {
-			return errors.New("execution: reconciliation settled cash mismatch")
+			return ErrReconciliationCashMismatch
 		}
 		rows, err := tx.Query(opListReconciliationPositions, s.accountID)
 		if err != nil {

@@ -265,6 +265,10 @@ func (s *RemoteCommandService) CloseOrders(cmd RemoteCommand) (*RemoteCommandRes
 			lock.Lock()
 			orders := make([]*ormo.InOutOrder, 0, len(openOrders))
 			for _, order := range openOrders {
+				// Terminal projections stay in the registry on execution-backed managers.
+				if order == nil || order.Status >= ormo.InOutStatusFullExit {
+					continue
+				}
 				if cmd.OrderID <= 0 || order.ID == cmd.OrderID {
 					orders = append(orders, order)
 				}

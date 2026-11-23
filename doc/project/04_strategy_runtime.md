@@ -37,7 +37,9 @@
 | `runtime/shared_account.go` | `Process.BorrowAccount`、共享账户 `acquireSharedAccount`/`closeSharedAccounts` |
 | `runtime/time_series_live.go` | `InstallTimeSeriesLive`：TS 实时订阅安装、`EnvironmentEnded` 回调 |
 | `runtime/shared_legacy_live.go` | `BindFactorLegacyJobs`：把 legacy TS Job 绑定到 Runtime 的 StratJob 注册表与 Trader |
-| `runtime/shared_migration.go` | `CutoverLegacyExecution`：旧 Runtime 关闭后的执行账户迁移 |
+| `runtime/live_hooks.go` | execution 路径上原 `CryptoTrader` 在 `biz.Trader` 周围承担的职责：批量回调触发、策略停机钩子、`strat_perf` 加载、实盘序列观察者 `SetSeriesObserver`；状态按 `Runtime` 存入注册表，由停止钩子释放 |
+| `runtime/perf_update.go` | execution 路径的 `strat_perf` 逐单得分：`Runtime.observeClosedOrder`（由 `OrderNotifyCallback` 在每次成交回调中调用）把已完全平仓的订单克隆入容量 256 的队列，单 worker 维护每 job（策略+品种+周期）的内存环（容量 `max_od_num`，非正时 1000），按 lot 键去重，再对私有 `OrderState` 调用未改动的 `strat.CalcJobScoresWithState`；首次处理某 job 时从订单库已归档行预载（仅 Hub 路径有归档）；实盘模式下每次计算后 `DumpPerfs` 写 `strat_perfs.yml`；该 job 未启用 `strat_perf` 时不创建 tracker/goroutine/环，也不读库；队列满则丢弃并告警；按 `Runtime` 存入注册表，由停止钩子释放 |
+| `runtime/order_notify.go` | `Notifier`：execution 路径通知的异步前端（容量 256 的队列，满则丢弃，单 worker 独占对 rpc `Session` 的调用）、`OrderNotifyCallback`、`ExcNotifyCore`、`NotifyStarted`/`NotifyShutdown` |
 | `runtime/legacy_execution.go` | legacy 发送器（LegacySender）绑定选项与校验 |
 | `runtime/factor_state.go` | `FactorState`：因子回放组件的生命周期（Stop/Join） |
 | `runtime/shared_live.go`、`shared_sources*.go`、`shared_legacy_live.go` 中因子段 | 因子实时订阅安装、代际切换（归因子模块，本文只列边界） |
@@ -111,7 +113,9 @@
 - `Runtime.Stop`（`runtime.go:1236`）：`sharedExecution.Stop()` → `stopScheduler()` → `Core.Stop()`（触发注册的 `OnClose` 钩子）。非阻塞、可重入。
 - `Runtime.Close`（`runtime.go:1294`）→ `closeOwned`（`runtime.go:1379`）：Stop → 执行 `OnCloseWait` 钩子（provider/socket/notification join）→ 等待回调租约 `callbackWait` → `Dump.Close` → 依次 `Market/Symbols/Batch/Strategies/Orders/Trading.Reset()` → `Core.Close()`。`Storage` 与 `Exchange` 为借用，不关闭。
 - `Process.Close`（`runtime.go:424`）：标记 closed → 关闭全部 Runtime 并 Join → 关闭账户 owner 与共享账户 → 关闭 SID registry。`Process.Stop` 只发布取消。
-- 正常 runner 路径：entry 先 `t.Run()` 返回再 `rt.Close()`；live 的 `CryptoTrader` 在停止时先关闭 provider 与 socket（见 `doc/runtime_context.md` §4）。
+- 正常 runner 路径：entry 先 `t.Run()` 返回再 `rt.Close()`；live 的 `CryptoTrader` 外壳在停止时执行关停相位（见 `doc/runtime_context.md` §4）。
+
+- execution 路径（`BindFactorLegacyJobs` 绑定的 Runtime）的策略停机钩子由 `runtime/live_hooks.go:bindLiveHooks` 以 `OnCloseWait` 注册一次：`runStrategyShutdown` 先等回调租约（此时 provider 已不再投递行情），再调用 `strat.ExitStratJobsWithState`（逐 Job `OnShutDown`、退订 WS，再逐策略 `OnStratExit`），早于 `Strategies.Reset`。`legacy` 全局状态的 Runtime 不执行。
 
 ### 9. Runtime 构造（`runtime/runtime.go:614 Process.NewRuntime`）
 1. `beginRuntimeConstruction`（与 `Process.Close` 互斥）→ 校验 `Options`（Hub/Shared/Legacy 组合规则、交易所身份）。
@@ -139,7 +143,7 @@
 
 - **RunPolicy（`config.RunPolicyConfig`）**：`stake_rate`（覆盖 `StakeRate`）、`order_bar_max`、`stop_loss`（数值或 `"5%"`）、`run_timeframes`、`max_pair`、`pair_params`（触发 `PairDup` 重新实例化）、`refine_tf`、`filters`（`runtimeplan` 中会报 unsupported）。
 - **全局/Config**：`config.OrderBarMax`（默认 500）、`config.Data.BTLegacyIntrabar`（仅非 explicit 路径）、`core.MinStakeAmount`（5.5）、`PairMgr.PosOnRotation`（轮换时是否继续持仓）、`Database.SIDRegistryURL` / `Database.AutoCreate`（SID 权威）。
-- **Runtime Options**：`Storage`、`Exchange`（借用）、`Scheduler`/`SchedulerBorrowed`、`Catalog`、`SourcePlanOptions`、`StorageNamespace`、`DataDir`、`StrategyDir`、`Dump`、`LegacyExecution`、`SharedExecution`、`SharedOrderBridge`、`HubOrderBridge`、`AccountOwnerKey`。
+- **Runtime Options**：`Storage`、`Exchange`（借用）、`Scheduler`/`SchedulerBorrowed`、`Catalog`、`SourcePlanOptions`、`StorageNamespace`、`DataDir`、`StrategyDir`、`Dump`、`LegacyExecution`、`SharedExecution`、`SharedOrderBridge`（仅 `Mode=backtest`，即混合回测的 `SharedOrderMgr`）、`HubOrderBridge`（实盘/dry_run 的时序订单桥，含混合账户）、`AccountOwnerKey`。
 - **外部包**：`banta`（`ta.BarEnv`、`ta.Series`）、`banexg`（交易所接口与 `OdSide*`）、`orm`（`SymbolState`、`DataSeries`、`Subscription`、`SIDAllocator`、`SymbolSIDRegistry`）、`biz`（订单管理、Trader、`RuntimeDeps`）、`data`（`LiveProvider`、`DataSourceCatalog`、`SubscriptionPlan`）、`com`（`Scheduler`、`PriceState`、`MarketState`）、`btime`、`factor/runner`（FactorState）、`execution`（账户 owner、共享账户）。
 
 ## 与其他模块的交互边界
@@ -147,7 +151,7 @@
 - **strat -> biz（单向）**：策略不 import `biz`。订单处理经 `BindOrderProcessor` 注入；`biz` 通过 `State` 的 `Get/Version/GetStratPerf/AddAccFailOpens/RefineTimeFrame` 查询策略；`biz/trader.go` 驱动 `SetData/SetWarmUp/InitBar/OnData/CheckCustomExits/ProcessOrders` 的事件顺序。
 - **runtime -> biz**：`Runtime.BizDeps()` 投影（`runtime.go:1088`）；`biz.BindRuntimeDeps` 完成一次性绑定；`NewTraderWithRuntimeDeps`、`NewRuntimeNotifications`、`GetOdMgrWithState`。
 - **runtime -> data**：`DataDeps()`（`runtime.go:1124`）、`LiveProvider`、订阅计划。
-- **live / entry / opt -> runtime**：构造与关闭由调用方负责（`entry` 先关 Process 再释放自建 Storage/Exchange；`opt` 每轮创建并释放 Runtime；`live/common.go:99-119` 与 `live/crypto_trader.go:1681` 调用 `LoadStratJobsWithState`/`ExitStratJobsWithState`/`FinalizePairRotation`）。
+- **live / entry / opt -> runtime**：构造与关闭由调用方负责（`entry` 先关 Process 再释放自建 Storage/Exchange；`opt` 每轮创建并释放 Runtime；回测的 `biz.RefreshJobsWithRuntimeDeps` 调用 `LoadStratJobsWithState`/`ExitStratJobsWithState`/`FinalizePairRotation`）。
 - **runtimeplan <- entry/web**：只读 Inspect；不得依赖其副作用，`Inspect` 不安装包级 globals（但 `makeStrategy` 仍可能访问 `config.Data` 等非 explicit 路径）。
 - **包级兼容 facade**：`strat/state.go:525-` 的 `legacyState` 将 `Versions/Envs/AccJobs/PairStrats/cacheStrats` 等包级变量作为视图；`core` 的 `LegacyTimeFrameStateSnapshot`/`ReplaceLegacyOrderMatchTfs` 同理。新代码应只使用显式 `State`。
 
@@ -169,6 +173,12 @@
   - `Inspect` 中 `OpenOrder` 等会被标记为 unsupported，不要在 `OnStartUp` 等启动回调中下单。
 
 ## 已知限制与设计取舍
+
+- **execution 路径的实盘钩子**（`runtime/live_hooks.go`，由 `BindFactorLegacyJobs` 末尾的 `bindLiveHooks` 和 `feedFactorLegacy` 触发；`feedFactorLegacy` 先调 `publishSeries`、`batchFeed`，再 `UpdateByDataSeries` 与 `Trader.FeedDataSeries`）：
+  - 批量回调：绑定时若有策略同时设置 `BatchInOut && OnBatchJobs` 或 `BatchInfo && OnBatchInfos`，才启用。预热行在新 bar 结束时同步 `TryFireBatchesWithRuntimeDeps(…, warmup=true)`（预热不下单，并推进 `LastBatchMS`）；实盘行布置延迟 `core.DelayBatchMS` 的定时器，到点后以当前时钟触发，仍有未完成周期则同样延迟重试；定时器在 runtime 停止时取消，回调受回调租约保护并回收 panic。
+  - `SetSeriesObserver(fn)`：每条非预热行（`Values` 为拷贝）以 `data.SeriesMsg` 形态经容量 256 的有界队列交给单个 worker，队列满则丢行，慢观察者不拖慢行情，panic 被回收。入口层把它接到 `(*CryptoTrader).PublishSeries`（仪表盘实时图表）与 K 线延迟监控的收数进度（`entry/execution_robot.go:startExecutionRobotCrons`）。
+  - `strat_perf`：绑定时调用 `config.LoadPerfsWithCoreState`（未启用或文件不存在时无效）；逐单得分更新由 `runtime/perf_update.go` 完成（见上表与 `05_biz_orders_live.md`）。
+- **动态品种（`UpdatePairs`）在 execution 路径不可用**：`PairUpdateHooks` 只在回测安装（原安装方旧 `CryptoTrader.Init` 已删除），`Apply` 在 `SubWarmPairs` 缺失时返回 `pair updates are not available in this runtime: …`，品种在启动时固定、须写入配置。
 
 - `strat.LoadStratJobsWithRuntimeState` 为导出 API，仓库内无调用方，保留供外部使用。
 - 负止盈价会被改写为 `enterPrice*0.001`，随后方向校验报 “takeProfit must > enterPrice”，不视为未设置。

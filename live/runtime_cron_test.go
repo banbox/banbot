@@ -10,7 +10,6 @@ import (
 	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/com"
-	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/data"
 	"github.com/banbox/cron/v3"
@@ -70,26 +69,6 @@ func (s *runtimeFatalSchedulerProbe) AddFunc(string, func()) (cron.EntryID, erro
 func (s *runtimeFatalSchedulerProbe) Start() {}
 
 func (s *runtimeFatalSchedulerProbe) Stop() context.Context { return context.Background() }
-
-func TestCronFatalLossCheckRequiresRuntimeClock(t *testing.T) {
-	scheduler := &runtimeFatalSchedulerProbe{}
-	deps := biz.RuntimeDeps{
-		Config: config.NewSnapshot(&config.Config{
-			FatalStop: map[string]float64{"1": 0.5},
-		}),
-		Accounts: map[string]*config.AccountConfig{"account": {}},
-	}
-	cronFatalLossCheckWithRuntime(scheduler, deps, nil)
-	if got := scheduler.addCalls.Load(); got != 0 {
-		t.Fatalf("fatal-stop task registered without runtime clock: %d", got)
-	}
-
-	deps.Clock = btime.NewClockState(true, nil)
-	cronFatalLossCheckWithRuntime(scheduler, deps, nil)
-	if got := scheduler.addCalls.Load(); got != 1 {
-		t.Fatalf("fatal-stop task registrations = %d, want 1", got)
-	}
-}
 
 func TestCronKlineDelaysRequiresRuntimeClock(t *testing.T) {
 	scheduler := &runtimeFatalSchedulerProbe{}

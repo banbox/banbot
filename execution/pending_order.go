@@ -30,6 +30,15 @@ type PendingOrder struct {
 	LastNativeFill       string
 	LastNativeProtection ProtectionKind `json:",omitempty"`
 	ProtectionPlacement  map[string]ProtectionPlacement
+	// ReductionHolds counts consecutive ticks this lot's reduction was held to
+	// sequence it behind an opposite-side reduction of the same strategy. It
+	// orders the next conflict (see sequenceOpposite) and resets on execution.
+	ReductionHolds int `json:",omitempty"`
+	// OCOGroup is the optional One-Cancels-the-Other entry group key, scoped by
+	// (strategy, instrument) at resolution; OCOSeq is the owner's admission
+	// order of the member (tie-break, see resolvePendingOCO).
+	OCOGroup string `json:",omitempty"`
+	OCOSeq   int64  `json:",omitempty"`
 }
 
 // AdvanceProtection selects at most one reduction. Selection is deterministic

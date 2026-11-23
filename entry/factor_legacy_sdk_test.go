@@ -31,7 +31,24 @@ func TestFactorLegacySDKDelayedQuotesAllowFreshEntryAndExplicitExit(t *testing.T
 	}}
 	p := runtime.NewProcess()
 	defer p.Close()
-	rt, err := p.NewRuntime(runtime.Options{Mode: core.RunModeLive, AccountOwnerKey: &key, SharedExecution: &biz.SharedExecutionOptions{StorePath: filepath.Join(dir, "ledger.db"), SenderLeaseDir: filepath.Join(dir, "leases"), Adapter: adapter, AuthoritativeSnapshot: true}, SharedOrderBridge: bridge})
+	// Live composition: HubOrderMgr over an in-process Hub port onto the account.
+	options := biz.SharedExecutionOptions{StorePath: filepath.Join(dir, "ledger.db"), SenderLeaseDir: filepath.Join(dir, "leases"), Adapter: adapter, AuthoritativeSnapshot: true}
+	borrow, err := p.BorrowAccount(key, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer borrow.Release()
+	embedded, err := execution.NewEmbeddedHub(ctx, borrow.Service(), 20*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := embedded.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	hubBridge := &biz.HubOrderBridgeConfig{Client: embedded.Port(), Account: key, Bridge: *bridge, WriterID: "ts-local-test", StatePath: filepath.Join(dir, "robot", "ts-local.json"), LocalAccount: true}
+	rt, err := p.NewRuntime(runtime.Options{Mode: core.RunModeLive, Env: core.RunEnvProd, AccountOwnerKey: &key, SharedExecution: &options, SharedMarketData: true, HubOrderBridge: hubBridge})
 	if err != nil {
 		t.Fatal(err)
 	}

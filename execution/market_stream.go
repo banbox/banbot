@@ -71,7 +71,11 @@ func StartBanexgMarketStream(parent context.Context, account *SharedAccount, exc
 	readQuote := func(symbol string) (VisibleQuote, error) {
 		readCtx, done := context.WithTimeout(ctx, min(ttl, 15*time.Second))
 		defer done()
-		book, err := exchange.FetchOrderBook(symbol, 0, map[string]any{banexg.ParamContext: readCtx, banexg.ParamRetry: 0})
+		book, err := exchange.FetchOrderBook(symbol, accountQuoteDepthLevels, map[string]any{banexg.ParamContext: readCtx, banexg.ParamRetry: 0})
+		if err != nil && err.Code == errs.CodeParamInvalid {
+			// The venue does not offer the small depth: use the SDK default.
+			book, err = exchange.FetchOrderBook(symbol, 0, map[string]any{banexg.ParamContext: readCtx, banexg.ParamRetry: 0})
+		}
 		if err != nil {
 			return VisibleQuote{}, errors.New("execution: account depth snapshot unavailable")
 		}
@@ -104,7 +108,7 @@ func StartBanexgMarketStream(parent context.Context, account *SharedAccount, exc
 			return VisibleQuote{}, failed
 		}
 		if !ok || q.ValidUntilMS <= now {
-			return VisibleQuote{}, fmt.Errorf("execution: account depth not yet visible or stale: %s", id)
+			return VisibleQuote{}, fmt.Errorf("%w: %s", ErrAccountQuoteNotVisible, id)
 		}
 		return q, nil
 	}, func() int64 { return time.Now().UnixMilli() }); err != nil {
@@ -119,7 +123,7 @@ func StartBanexgMarketStream(parent context.Context, account *SharedAccount, exc
 			return nil, err
 		}
 	}
-	updates, watchErr := exchange.WatchOrderBooks(symbols, 0, map[string]any{banexg.ParamContext: ctx})
+	updates, watchErr := watchAccountDepth(exchange, symbols, ctx)
 	if watchErr != nil || updates == nil {
 		borrow.Release()
 		cancel()
@@ -165,6 +169,7 @@ func StartBanexgMarketStream(parent context.Context, account *SharedAccount, exc
 			ticker := time.NewTicker(refreshEvery)
 			defer ticker.Stop()
 			unit := bySymbol[symbol]
+			var lastRead time.Time
 			for {
 				select {
 				case <-ctx.Done():
@@ -172,6 +177,17 @@ func StartBanexgMarketStream(parent context.Context, account *SharedAccount, exc
 				case <-ticker.C:
 				case <-wake[symbol]:
 				}
+				// Websocket depth wakes arrive every ~100ms; without a floor the
+				// REST snapshot loop runs as fast as the venue answers and spends
+				// request weight shared by every process on the host IP.
+				if wait := min(ttl/4, accountQuoteMinRefresh) - time.Since(lastRead); wait > 0 {
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(wait):
+					}
+				}
+				lastRead = time.Now()
 				q, err := readQuote(symbol)
 				if err != nil {
 					if ctx.Err() != nil {
@@ -234,7 +250,7 @@ func StartBanexgMarketStream(parent context.Context, account *SharedAccount, exc
 						case <-time.After(250 * time.Millisecond):
 						}
 						var err *errs.Error
-						updates, err = exchange.WatchOrderBooks(symbols, 0, map[string]any{banexg.ParamContext: ctx})
+						updates, err = watchAccountDepth(exchange, symbols, ctx)
 						if err == nil && updates != nil {
 							break
 						}
@@ -254,8 +270,56 @@ func StartBanexgMarketStream(parent context.Context, account *SharedAccount, exc
 	return stream, nil
 }
 
+// accountQuoteDepthLevels is the depth requested for account quotes, both for
+// the REST snapshot and the websocket wake-up subscription. Only the best bid
+// and ask are used. A full REST book costs several times the request weight
+// (Binance: 500 levels weigh 10, 5 levels weigh 2), and an unlimited websocket
+// subscription is an incremental book that banexg seeds and re-seeds with REST
+// snapshots after every gap; a small limit subscribes to a self-contained
+// partial-depth stream instead (no REST weight).
+const accountQuoteDepthLevels = 5
+
+// watchAccountDepth subscribes the wake-up depth stream with the small limit
+// and falls back to the SDK default depth when the venue does not offer that
+// limit (banexg reports CodeParamInvalid), so no venue-specific list is kept.
+func watchAccountDepth(exchange banexg.BanExchange, symbols []string, ctx context.Context) (chan *banexg.OrderBook, *errs.Error) {
+	updates, err := exchange.WatchOrderBooks(symbols, accountQuoteDepthLevels, map[string]any{banexg.ParamContext: ctx})
+	if err != nil && err.Code == errs.CodeParamInvalid {
+		return exchange.WatchOrderBooks(symbols, 0, map[string]any{banexg.ParamContext: ctx})
+	}
+	return updates, err
+}
+
+// accountQuoteMinRefresh caps the minimum spacing of REST quote snapshots per
+// instrument (websocket depth only wakes the refresh earlier, never faster).
+// The spacing is min(TTL/4, accountQuoteMinRefresh): 1s for the Hub's 5s TTL.
+const accountQuoteMinRefresh = time.Second
+
+// accountClockSkewMS is how far an exchange book timestamp may lie ahead of
+// the local receive time. NTP-synchronised hosts routinely run a few hundred
+// milliseconds behind an exchange; without this tolerance account registration
+// and every quote read failed on such hosts. A book within the tolerance is
+// treated as observed at the receive time (it cannot be older than that); a
+// book further in the future still indicates a broken clock and is refused.
+const accountClockSkewMS = 1000
+
+// observedBookMS applies accountClockSkewMS to a venue book timestamp. It
+// returns the observation time (never later than the local receive time) and
+// whether the book is fresh within ttl. Every account quote read uses it.
+func observedBookMS(bookMS, received int64, ttl time.Duration) (int64, bool) {
+	if bookMS <= 0 || bookMS > received+accountClockSkewMS {
+		return 0, false
+	}
+	observed := min(bookMS, received)
+	return observed, received-observed < ttl.Milliseconds()
+}
+
 func accountBookQuote(book *banexg.OrderBook, received int64, ttl time.Duration) (VisibleQuote, error) {
-	if book == nil || book.Bids == nil || book.Asks == nil || book.TimeStamp <= 0 || book.TimeStamp > received || received-book.TimeStamp >= ttl.Milliseconds() {
+	if book == nil || book.Bids == nil || book.Asks == nil {
+		return VisibleQuote{}, errors.New("execution: invalid or stale account depth timestamp")
+	}
+	observed, fresh := observedBookMS(book.TimeStamp, received, ttl)
+	if !fresh {
 		return VisibleQuote{}, errors.New("execution: invalid or stale account depth timestamp")
 	}
 	bid, _ := book.Bids.Level(0)
@@ -268,5 +332,5 @@ func accountBookQuote(book *banexg.OrderBook, received int64, ttl time.Duration)
 	if err != nil || !b.IsPositive() || a.LessThan(b) {
 		return VisibleQuote{}, errors.New("execution: invalid account depth spread")
 	}
-	return VisibleQuote{Bid: b, Ask: a, AtMS: book.TimeStamp, ReceivedMS: received, ValidUntilMS: book.TimeStamp + ttl.Milliseconds()}, nil
+	return VisibleQuote{Bid: b, Ask: a, AtMS: observed, ReceivedMS: received, ValidUntilMS: observed + ttl.Milliseconds()}, nil
 }

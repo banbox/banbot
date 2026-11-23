@@ -8,7 +8,7 @@
   - 创建并缓存 banexg 实例（`Setup` / `GetWith` / `NewForRuntime`），把 config 中的交易所选项、账户凭证、市场类型翻译为 banexg options；
   - 用 `BotExchange` 包装实例，挂接下单后回调；
   - 通过**可选能力接口**（optional capability）获取交易所专有语义（符号解析、client order id、订单事件、归档 URL、账户导出、K 线日对齐），未实现时给出确定的降级或错误；
-  - 精度换算（`PrecCost` / `PrecPrice` / `PrecAmount`）。
+  - 精度换算（`PrecCost` / `PrecFee`；价格与数量精度由调用方直接用 `exchange.PrecPrice`/`PrecAmount`）。
 - **goods/**：品种（交易对）筛选流水线。第一个过滤器必须是 `IProducer`，负责生成候选标的；其余过滤器按 config 顺序逐个过滤；最后应用 pairmgr 的 offset / limit，写入 `core` 运行时状态。
 - **doc/cn_markets/**：纯文档，无对应 Go 包。内容为国内期货/股票的数据源、柜台接入（CTP、XTP 等）、期货交易规则（主力连续、复权、合约编码）。仓库代码中与国内市场直接相关的只有：banexg `china` 适配器（通过 `exg/data.go` 的 `allowedExgIDs` 注册）、`config` 中按 `Countries=CN` 推导的 `Asia/Shanghai` 时区，以及 `ExchangeUsesOpaqueSymbols` 对 `china` 的短名不展开规则。
 
@@ -19,11 +19,11 @@
 | 文件 | 作用 |
 |------|------|
 | `data.go` | 全局 `Default` 交易所、`exgMap` 缓存、`allowedExgIDs`（binance/okx/bybit/china）与 `IsAllowedExgID` |
-| `biz.go` | `Setup`、`NewForRuntime`、`createConfigured`（config→options）、`GetWith`（缓存）、`Prec*`、`GetLeverage`、`GetOdBook`、`GetTickers24Hr` |
-| `ext.go` | `BotExchange` 包装类型、`getExchangeCapability[T]` 泛型解包、下单回调（`SetOrderCallback` / 旧全局 `AfterCreateOrder`）、`FetchOHLCVArchive`、`FetchPriceOHLCVArchive`、`FetchFundingRateArchive`、`FetchDerivativesMetricsArchive` 与 `FetchDerivativesMetrics` 转发 |
+| `biz.go` | `Setup`、`NewForRuntime`、`createConfigured`（config→options）、`GetWith`（缓存）、`PrecCost`/`PrecFee` 包装 |
+| `ext.go` | `BotExchange` 包装类型、`getExchangeCapability[T]` 泛型解包、`PutOrderRes`（仅为旧 dump 的 gob 解码保留）、`FetchOHLCVArchive`、`FetchPriceOHLCVArchive`、`FetchFundingRateArchive`、`FetchDerivativesMetricsArchive` 与 `FetchDerivativesMetrics` 转发 |
 | `symbol.go` | 符号解析：`ResolvePriceSymbol`、`ResolveRuntimePriceSymbol`、`NewPriceSymbolParser*`、`NewLegacyPriceSymbolParser` |
-| `client_order.go` | client order id：`BuildClientOrderID`（兼容，失败回落 banexg 旧格式）、`BuildClientOrderIDChecked`（严格） |
-| `order_events.go` | `OrderEventCapability` 获取与 `RequireOrderEventCapability`（实盘严格模式） |
+| `client_order.go` | client order id：`BuildClientOrderID`（优先 adapter 能力，失败回落 banexg 旧格式） |
+| `fee.go` | `OrderFee`：经规范化 SDK 接口计算已成交订单手续费（先把普通限价类型改写为 maker 形式）；`biz.OrderMgr` 与 `ormo.InOutOrder.UpdateFee` 共用 |
 | `alignment.go` | 日线以上周期的对齐偏移：`GetAlignOffForMarket`（由 DayTimes/NightTimes 推导）及各层包装 |
 | `account_download.go` | 账户导出（`StartAccountDownload` / `GetAccountDownload`）与归档 URL（`BuildArchiveURL*`）的能力接口 |
 | `*_test.go` | 行为佐证（symbol、alignment、order_events、account_download、biz_runtime） |
@@ -57,7 +57,6 @@
 |------|----------|------|------------------------|
 | `PriceSymbolCapability` | exg/symbol.go（同名接口亦在 banexg/symbol.go:7） | 解析交易所专有符号 | 仅 `china` |
 | `ClientOrderCapability` | banexg/client_order.go，exg/client_order.go 别名 | 生成 client order id | `binance`、`okx`、`bybit` |
-| `OrderEventCapability` | exg/order_events.go（banexg/order_event.go 提供默认实现） | 解析 client id、订单事件 id、订单时间戳 | `binance`、`okx`、`bybit` 提供 Parse/Build 等方法 |
 | `OHLCVArchiveFetcher` | banexg/intf.go:13 | 按归档读取 K 线 | `binance`（binance/vision.go） |
 | `PriceOHLCVArchiveFetcher` | banexg/intf.go:21 | 按归档读取合约 `mark`/`index`/`premiumIndex` 价格 K 线 | `binance`（binance/vision.go，月度/日度 `markPriceKlines`/`indexPriceKlines`/`premiumIndexKlines` zip） |
 | `FundingRateArchiveFetcher` | banexg/intf.go:21 | 按归档读取永续合约历史资金费率 | `binance`（binance/vision.go，月度 `fundingRate` zip） |
@@ -66,7 +65,7 @@
 | `AccountDownloadCapability` | exg/account_download.go:12 | 异步账户导出 | **未见任何实现** |
 | `ArchiveURLCapability` | exg/account_download.go:71 | 构造归档下载 URL | **未见任何实现** |
 
-- **下单回调**：`BotExchange.SetOrderCallback` 为实例级（优先）；包级 `AfterCreateOrder` 为旧版全局回退。显式设置的 nil 回调会禁用回退（ext.go:91-101）。
+- **下单回调**：已删除（`BotExchange.CreateOrder` 不再包装）。`PutOrderRes` 类型与其 gob 注册（`orm/dump.go`、`biz/tools.go`）保留，使旧 dump 仍可解码。
 
 ### goods
 
@@ -111,11 +110,11 @@
 
 ### 3. 下单回调
 
-`biz/odmgr_live.go:216`：有 runtime deps 时调用 `exg.SetOrderCallback(deps.Exchange, logPutOrderWithDump(...))`（实例级）；否则若包级 `AfterCreateOrder` 为空则设为 `logPutOrder`（odmgr_live.go:217-218）。`BotExchange.CreateOrder`（ext.go:62）对成功与失败的下单都会触发回调。
+已删除：旧实盘栈曾在 `BotExchange.CreateOrder` 上挂回调记录下单结果；现在 `BotExchange` 只做 SDK 能力转发。
 
 ### 4. 精度换算
 
-`biz/odmgr_live.go:2504`（`PrecAmount`）、`:2661`（`PrecPrice`）、`biz/wallet.go:1181`（`PrecCost`）→ `precNum`（exg/biz.go:161）。对 `amount`：若 `market.Contract && ContractSize != 1`，先除以合约乘数再 `PrecAmount`，结果再乘回。`source` 不在 cost/price/amount/fee 中会 `panic`。
+`biz/wallet.go`（`PrecCost`）→ `precNum`（exg/biz.go）；`exg.PrecPrice`/`exg.PrecAmount` 包装随旧栈删除，execution 适配器直接调用 `exchange.PrecPrice`/`PrecAmount`。对 `amount`：若 `market.Contract && ContractSize != 1`，先除以合约乘数再 `PrecAmount`，结果再乘回。`source` 不在 cost/price/amount/fee 中会 `panic`。
 
 ### 5. 符号解析
 
@@ -144,7 +143,7 @@
 
 ### 8. 品种刷新（runtime，主路径）
 
-`RefreshPairListWithRuntimeDeps`（goods/biz.go:222）被 `biz/biz.go:259`、`biz/tools.go:700`、`entry/runtime_entry.go:630`、`entry/series.go:83`、`entry/factor_storage.go:177`、`live/common.go:86`、`live/runtime_cron.go:98` 等调用。顺序如下：
+`RefreshPairListWithRuntimeDeps`（goods/biz.go:222）被 `biz/biz.go:259`、`biz/tools.go:700`、`entry/runtime_entry.go:630`、`entry/series.go:83`、`entry/factor_storage.go:177`、`live/runtime_cron.go` 等调用。顺序如下：
 
 1. 校验 `deps` 各字段（Symbols / Exchange / Config / Core 必须非空）。
 2. `staticPairsWithConfig(cfg)`：合并 `cfg.Pairs` 与各 `RunPolicy.Pairs` 并去重。
@@ -180,7 +179,7 @@
 - **banexg v0.2.66**：`bex.New`、`banexg.BanExchange`、`Market`（`DayTimes`/`NightTimes`/`Limits`/`Precision`/`ContractSize`）、`MapMarket`、`PriceOnePip`、`GetCurMarkets`、`FetchOrderBook`、`FetchTickers`。
 - **bntp**：`bntp.LangCode`（NTP 语言，config.NTPLangCode）。
 - **orm**：`SymbolState`、`ExSymbol`、`EnsureCurSymbols*`、`FastBulkOHLCVWithSymbolState*`、`GetSeries`、`ApplyAdj`、`GetAlignOff`（orm 自有，非 exg 的）。
-- **core**：`State`（SetPairs / SetPairBanUntil / BannedPairs / PairEnabled）、`SplitSymbol`、`AdjFront`、`AmtDust`、`GetOdBook` / `SetOdBook`、全局 `ExgName` / `Market` / `ContractType` / `IsContract`。
+- **core**：`State`（SetPairs / SetPairBanUntil / BannedPairs / PairEnabled）、`SplitSymbol`、`AdjFront`、`AmtDust`、`GetOdBook` / `SetOdBook`（订单簿缓存，供 `fireWsSeries` 判断价格来源）、全局 `ExgName` / `Market` / `ContractType` / `IsContract`。
 - **utils / gonum**：`utils.CalcCorrMat`、`utils.StdDevVolatility`、`floats.Sum`。
 - **pgx**：`goods/filters.go` 的 `querySeries` 使用 `pgxpool.Conn`。
 
@@ -190,7 +189,7 @@
 - **config**：`config` 向 exg 提供 `Exchange`、`Accounts`、`BakAccounts`、`Snapshot`；向 goods 提供 `PairFilters`、`PairMgr`、`RunPolicy`、`StakeCurrencyMap` 等。`config/exchange_capabilities.go` 通过 `bex.New(name, nil)` 询问 adapter 的符号规则与默认时区。
 - **orm**：goods 通过 `SymbolState` / `ExSymbol` 读取品种与上市日期，写入 `EnsureCurSymbols`；exg 的对齐偏移被 `orm/kline.go`、`orm/ohlcv_series.go` 使用。
 - **core**：goods 写入 `core.State` 的 pairs 与 ban 状态；`com/price_state.go` 使用 exg 的符号解析策略。
-- **biz / live / entry / runtime / strat**：通过 `exg.Default`（legacy）或 runtime 注入的 `Exchange`（runtime）使用本模块；下单回调在 `biz/odmgr_live.go`；品种刷新由各 entry 调用 `RefreshPairListWithRuntimeDeps`。
+- **biz / live / entry / runtime / strat**：通过 `exg.Default`（legacy）或 runtime 注入的 `Exchange`（runtime）使用本模块；品种刷新由各 entry 调用 `RefreshPairListWithRuntimeDeps`。
 - **data**：`data/ws_loader.go:149`（`DownUrl`）与 `:623` 通过 `exg.BuildArchiveURL*` 构造归档 URL；`web/live/biz.go:1274/1296` 调用账户导出。
 - **web/dev**：`web/dev/api_dev.go:1747` 用 `IsAllowedExgID` 校验开发接口的交易所参数。
 
@@ -199,8 +198,8 @@
 ### 新增交易所专有行为
 
 1. 在 banexg 对应适配器中实现能力接口（如 `PriceSymbolParts`、`BuildClientOrderID`）。**不要**在 banbot 中按交易所名写分支（AGENTS.md 开发规约）。
-2. 如需新的能力，在 `exg/` 定义本地接口，使用 `getExchangeCapability[T]` 解包，并参照 `callClientOrderCapability` 做 recover 与空值保护；提供 `Checked` 与兼容两种入口（参照 `BuildClientOrderID` / `BuildClientOrderIDChecked`）。
-3. 若新增的是 `Prec*` / `GetLeverage` 类语义，优先放在 banexg 内；banbot 只做通用换算。
+2. 如需新的能力，在 `exg/` 定义本地接口，使用 `getExchangeCapability[T]` 解包，并参照 `callClientOrderCapability` 做 recover 与空值保护；能力失败时回落到兼容实现（参照 `BuildClientOrderID`）。
+3. 若新增的是 `Prec*` / 杠杆分档类语义，优先放在 banexg 内；banbot 只做通用换算。
 
 ### 新增允许的交易所 ID
 
@@ -225,15 +224,15 @@
 
 ### 注意事项与易踩坑
 
-- `exg.Default` 只由 legacy `Setup` 设置。`NewForRuntime` 与 `GetWith` 的实例不会写入 `Default`；但 `exg.GetLeverage`、`exg.GetOdBook` 等仍直接读 `Default`（见文末“已知限制与设计取舍”）。
+- `exg.Default` 只由 legacy `Setup` 设置。`NewForRuntime` 与 `GetWith` 的实例不会写入 `Default`；`exg.GetLeverage`/`exg.GetOdBook`/`exg.GetTickers24Hr` 已随旧栈删除。
 - `GetWith` 的缓存 key 不含 env 与账户，同 key 复用实例时会调用 `SetMarketType`。
 - `precNum` 对合约市场的 amount 会按 `ContractSize` 换算；新增交易所时要确认 banexg 返回的 `ContractSize` 语义。
-- `BotExchange.CreateOrder` 对成功与失败都会触发回调，回调收到的 `Err` 可能非空。回调返回的错误会覆盖原错误，但 `order` 仍返回。
+- `BotExchange` 不再拦截 `CreateOrder`。
 - 过滤器对象在 runtime 下每次刷新都会重新构造（`GetPairFiltersWithConfig`），legacy 全局过滤器则跨刷新复用（`CorrelationFilter` 的 TopN 已改用局部变量，不再写回字段）。
 - `OffsetFilter` / `ShuffleFilter` 已改为先复制入参再处理，不会修改调用方切片。
 - 过滤器的 `AllowEmpty` 来源于 `PairMgr.Cron`（经 `GetPairFiltersWithConfig` 传入），改动定时刷新配置会改变过滤器的空数据行为。
 - 对齐偏移只对 `tfSecs >= 86400` 生效，日内周期永远为 0。
-- 测试：`exg/symbol_test.go`、`exg/alignment_test.go`、`exg/order_events_test.go`、`goods/biz_test.go` 覆盖主要路径；过滤器的 `SpreadFilter` 与 `cache_secs` 没有行为测试。
+- 测试：`exg/symbol_test.go`、`exg/alignment_test.go`、`goods/biz_test.go` 覆盖主要路径；过滤器的 `SpreadFilter` 与 `cache_secs` 没有行为测试。
 
 ## 已知限制与设计取舍
 

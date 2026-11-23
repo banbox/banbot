@@ -173,7 +173,7 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 		m.mu.Unlock()
 	}
 	if hooks.SubWarmPairs == nil {
-		return nil, errs.NewMsg(core.ErrRunTime, "PairUpdateHooks.SubWarmPairs not set")
+		return nil, errs.NewMsg(core.ErrRunTime, "pair updates are not available in this runtime: hooks are installed only for backtests; on the execution-backed prod/dry_run path pairs are fixed at startup and must be declared in the configuration")
 	}
 	if req.Strat == nil || req.Strat.Policy == nil {
 		return nil, errs.NewMsg(errs.CodeParamRequired, "Strat and Strat.Policy are required")
@@ -201,7 +201,7 @@ func (m *PairUpdateManager) Apply(req PairUpdateReq) (*PairUpdateResult, *errs.E
 		}
 	}
 	if explicitStrategyState && hooks.SubWarmPairs == nil {
-		return nil, errs.NewMsg(core.ErrRunTime, "explicit strategy state requires PairUpdateHooks.SubWarmPairs")
+		return nil, errs.NewMsg(core.ErrRunTime, "pair updates are not available in this runtime: hooks are installed only for backtests; on the execution-backed prod/dry_run path pairs are fixed at startup and must be declared in the configuration")
 	}
 	if explicitStrategyState && hooks.LookupSymbol == nil {
 		return nil, errs.NewMsg(core.ErrRunTime, "explicit strategy state requires PairUpdateHooks.LookupSymbol or SymbolState")

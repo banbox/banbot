@@ -22,8 +22,6 @@ import (
 	"go.uber.org/zap"
 )
 
-const runtimeMinPairCronGapMS int64 = 30 * 60 * 1000
-
 // runtimeRunGate skips a scheduled invocation while the previous one is still
 // running. Cron jobs must never queue work that mutates the same runtime.
 type runtimeRunGate struct{ sync.Mutex }
@@ -35,12 +33,6 @@ func (g *runtimeRunGate) run(fn func()) bool {
 	defer g.Unlock()
 	fn()
 	return true
-}
-
-func (g *runtimeRunGate) runWait(fn func()) {
-	g.Lock()
-	defer g.Unlock()
-	fn()
 }
 
 func runtimeConfig(deps *biz.RuntimeDeps) *config.Config {
@@ -61,54 +53,20 @@ func runtimeDataDeps(deps *biz.RuntimeDeps, catalog *data.DataSourceCatalog) *da
 	}
 }
 
-func cronRefreshPairsWithRuntime(scheduler com.Scheduler, trader *CryptoTrader, dp data.IProvider,
-	deps *biz.RuntimeDeps, afterRefresh func() error) {
-	cfg := runtimeConfig(deps)
-	if scheduler == nil || trader == nil || dp == nil || cfg == nil || cfg.PairMgr == nil || cfg.PairMgr.Cron == "" {
-		return
-	}
-	lastRefreshMS := trader.currentTimeMS()
-	var gate runtimeRunGate
-	_, err := scheduler.AddFunc(cfg.PairMgr.Cron, func() {
-		gate.run(func() {
-			if !trader.runtimeActive() {
-				return
-			}
-			curMS := trader.currentTimeMS()
-			if curMS-lastRefreshMS < runtimeMinPairCronGapMS {
-				return
-			}
-			ran, refreshErr := trader.tryRefreshPairJobs(false)
-			if refreshErr != nil {
-				deps.Logger().Error("RefreshPairJobs fail", zap.Error(refreshErr))
-				return
-			}
-			if !ran {
-				return
-			}
-			lastRefreshMS = curMS
-			if afterRefresh != nil {
-				if err := afterRefresh(); err != nil {
-					deps.Logger().Error("RefreshPairJobs post-refresh fail", zap.Error(err))
-				}
-			}
-		})
-	})
-	if err != nil {
-		deps.Logger().Error("add runtime RefreshPairList fail", zap.Error(err))
-	}
-}
-
-func fetchHourKlinesWithRuntime(scheduler com.Scheduler, dp *data.LiveProvider, deps *biz.RuntimeDeps,
-	catalog *data.DataSourceCatalog) {
-	if scheduler == nil || dp == nil || deps == nil || deps.Symbols == nil {
+// fetchHourKlinesFromWithRuntime is fetchHourKlinesWithRuntime with an explicit
+// source of the hour-only symbol set. The legacy path reads the runtime symbol
+// state; the execution-backed path isolates the provider's symbol state, so its
+// entries pass the set derived from their own subscriptions.
+func fetchHourKlinesFromWithRuntime(scheduler com.Scheduler, dp *data.LiveProvider, deps *biz.RuntimeDeps,
+	catalog *data.DataSourceCatalog, hourOnly func() map[int32]*orm.ExSymbol) {
+	if scheduler == nil || dp == nil || deps == nil || deps.Symbols == nil || hourOnly == nil {
 		return
 	}
 	endMap := make(map[int32]int64)
 	var gate runtimeRunGate
 	_, err := scheduler.AddFunc("0 0 * * * *", func() {
 		gate.run(func() {
-			exsList := deps.Symbols.GetHourOnlySymbols()
+			exsList := hourOnly()
 			if len(exsList) == 0 {
 				return
 			}
@@ -146,54 +104,6 @@ func cronLoadMarketsWithRuntime(scheduler com.Scheduler, exchange banexg.BanExch
 	})
 	if err != nil {
 		runtimeCore.Log().Error("add runtime CronLoadMarkets fail", zap.Error(err))
-	}
-}
-
-func runtimeFatalStops(cfg *config.Config) (map[int]float64, int, int) {
-	result := make(map[int]float64)
-	if cfg == nil {
-		return result, 0, 0
-	}
-	for text, rate := range cfg.FatalStop {
-		minutes, err := strconv.Atoi(strings.TrimSpace(text))
-		if err != nil || minutes <= 0 {
-			continue
-		}
-		result[minutes] = rate
-	}
-	hours := cfg.FatalStopHours
-	if hours <= 0 {
-		hours = 8
-	}
-	maxInterval := 0
-	for interval := range result {
-		if interval > maxInterval {
-			maxInterval = interval
-		}
-	}
-	return result, hours, maxInterval
-}
-
-func cronFatalLossCheckWithRuntime(scheduler com.Scheduler, deps biz.RuntimeDeps, nowMS func() int64) {
-	fatal, hours, maxInterval := runtimeFatalStops(runtimeConfig(&deps))
-	if scheduler == nil || len(fatal) == 0 || maxInterval <= 0 {
-		return
-	}
-	if nowMS == nil {
-		if deps.Clock == nil {
-			return
-		}
-		nowMS = deps.Clock.TimeMS
-	}
-	interval := maxInterval
-	if interval > 5 {
-		interval = 5
-	}
-	check := biz.MakeCheckFatalStopWithRuntime(deps, fatal, hours, nowMS)
-	var gate runtimeRunGate
-	_, err := scheduler.AddFunc(fmt.Sprintf("35 */%d * * * *", interval), func() { gate.run(check) })
-	if err != nil {
-		deps.Logger().Error("add runtime CronFatalLossCheck fail", zap.Error(err))
 	}
 }
 
@@ -353,13 +263,10 @@ func cronDumpStratOutputsWithRuntime(scheduler com.Scheduler, state *strat.State
 	}
 }
 
-func cronCheckTriggerOdsWithRuntime(scheduler com.Scheduler, deps biz.RuntimeDeps) {
-	if scheduler == nil {
-		return
-	}
-	var gate runtimeRunGate
-	_, err := scheduler.AddFunc("15,45 * * * * *", func() { gate.run(func() { biz.VerifyTriggerOdsWithRuntimeDeps(deps) }) })
-	if err != nil {
-		deps.Logger().Error("add runtime VerifyTriggerOds fail", zap.Error(err))
+func sendRuntimeMessage(deps *biz.RuntimeDeps, message map[string]interface{}) {
+	if deps == nil {
+		rpc.SendMsg(message)
+	} else if deps.Notifications != nil {
+		deps.Notifications.SendMsg(message)
 	}
 }

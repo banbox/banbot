@@ -45,7 +45,7 @@ func TestMixedLiveAccountConfigScopesPoliciesAndAccounts(t *testing.T) {
 
 func TestMixedLiveBuildsRealJobsOnSharedAccount(t *testing.T) {
 	dir := t.TempDir()
-	body := "config_version: 2\ntime_start: '20240101'\ntime_end: '20240102'\nexchange: {name: mixedfixture}\nmarket_type: linear\nstake_currency: [USD]\npairs: ['ASSET/USD:USD']\naccounts: {default: {}}\nrun_policy:\n  - name: mixed-live-ts\n    capital_weight: 0.5\n    run_timeframes: [1m]\n"
+	body := "config_version: 2\nenv: prod\ntime_start: '20240101'\ntime_end: '20240102'\nexchange: {name: mixedfixture}\nmarket_type: linear\nstake_currency: [USD]\npairs: ['ASSET/USD:USD']\naccounts: {default: {}}\nrun_policy:\n  - name: mixed-live-ts\n    capital_weight: 0.5\n    run_timeframes: [1m]\n"
 	spec, err := config.LoadRunSpec(&config.CmdArgs{NoDefault: true, DataDir: dir, ConfigData: body}, false)
 	if err != nil {
 		t.Fatal(err)
@@ -95,7 +95,28 @@ func TestMixedLiveBuildsRealJobsOnSharedAccount(t *testing.T) {
 		t.Fatal(adapterErr)
 	}
 	key := execution.AccountKey{VenueSessionIdentity: dir, Account: "default", SettlementDomain: "USD"}
-	rt, rtErr := p.NewRuntime(runtimepkg.Options{Context: context.Background(), Config: snapshot.View(), Mode: core.RunModeBackTest, Exchange: ex, ExchangeName: "mixedfixture", Market: "linear", NetDisable: true, AccountOwnerKey: &key, SharedExecution: &biz.SharedExecutionOptions{StorePath: filepath.Join(dir, "execution.db"), SenderLeaseDir: filepath.Join(dir, "leases"), Adapter: adapter, AuthoritativeSnapshot: true}, SharedOrderBridge: binding.Legacy.Bridge})
+	// Live composition of a mixed account: the TS part trades through
+	// biz.HubOrderMgr over an in-process Hub port onto the borrowed account.
+	options := biz.SharedExecutionOptions{StorePath: filepath.Join(dir, "execution.db"), SenderLeaseDir: filepath.Join(dir, "leases"), Adapter: adapter, AuthoritativeSnapshot: true}
+	borrow, borrowErr := p.BorrowAccount(key, options)
+	if borrowErr != nil {
+		t.Fatal(borrowErr)
+	}
+	t.Cleanup(borrow.Release)
+	embedded, embeddedErr := execution.NewEmbeddedHub(context.Background(), borrow.Service(), time.Second)
+	if embeddedErr != nil {
+		t.Fatal(embeddedErr)
+	}
+	t.Cleanup(func() {
+		if err := embedded.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	hubBridge, hubErr := tsHubLocalBridge(snapshot, key, *binding.Legacy.Bridge, embedded.Port())
+	if hubErr != nil {
+		t.Fatal(hubErr)
+	}
+	rt, rtErr := p.NewRuntime(runtimepkg.Options{Context: context.Background(), Config: snapshot.View(), Mode: core.RunModeLive, Env: core.RunEnvProd, Exchange: ex, ExchangeName: "mixedfixture", Market: "linear", NetDisable: true, AccountOwnerKey: &key, SharedExecution: &options, HubOrderBridge: hubBridge, SharedMarketData: true})
 	if rtErr != nil {
 		t.Fatal(rtErr)
 	}
@@ -120,19 +141,26 @@ func TestMixedLiveBuildsRealJobsOnSharedAccount(t *testing.T) {
 	if len(binding.Legacy.Jobs) != 1 || len(rt.FactorLegacySubscriptions()) == 0 {
 		t.Fatal("real TS jobs not bound")
 	}
-	if _, ok := biz.GetOdMgrWithState(rt.Trading, "default").(*biz.SharedOrderMgr); !ok {
-		t.Fatal("TS uses independent ledger")
+	manager, ok := biz.GetOdMgrWithState(rt.Trading, "default").(*biz.HubOrderMgr)
+	if !ok {
+		t.Fatalf("a mixed live account must build HubOrderMgr for its TS part, got %T", biz.GetOdMgrWithState(rt.Trading, "default"))
 	}
+	t.Cleanup(func() { manager.CleanUp() })
 	trader, traderErr := biz.NewTraderWithRuntimeDeps(rt.BizDeps())
 	if traderErr != nil {
 		t.Fatal(traderErr)
 	}
-	rt.Clock.SetTimeMS(120000)
-	if feedErr := trader.FeedDataSeries(&orm.DataSeries{Sid: 1, Source: orm.SeriesSourceKline, TimeFrame: "1m", TimeMS: 60000, EndMS: 120000, Closed: true, Values: map[string]any{"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0, "volume": 1.0, "integer": int64(9), "nullable": nil}}); feedErr != nil {
+	// The Hub order manager and the account run on the wall clock.
+	barEnd := time.Now().UnixMilli() / 60000 * 60000
+	rt.Clock.SetTimeMS(time.Now().UnixMilli())
+	if feedErr := trader.FeedDataSeries(&orm.DataSeries{Sid: 1, Source: orm.SeriesSourceKline, TimeFrame: "1m", TimeMS: barEnd - 60000, EndMS: barEnd, Closed: true, Values: map[string]any{"open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0, "volume": 1.0, "integer": int64(9), "nullable": nil}}); feedErr != nil {
 		t.Fatal(feedErr)
 	}
 	if callbacks != 1 {
 		t.Fatalf("TS callback did not execute: %d", callbacks)
+	}
+	if updateErr := manager.UpdateByDataSeries(nil, nil); updateErr != nil {
+		t.Fatal(updateErr)
 	}
 	orders, lock := rt.Orders.GetOpenODs("default")
 	lock.Lock()
@@ -219,7 +247,7 @@ func testMixedLiveAutomaticBinding(t *testing.T, factoryFrames bool) {
 		}
 	}()
 	name := fmt.Sprintf("automatic_live_%d", time.Now().UnixNano())
-	body := "config_version: 2\ntime_start: '20240101'\ntime_end: '20240102'\nexchange: {name: mixedfixture}\nmarket_type: linear\nstake_currency: [USD]\npairs: ['ASSET1/USD:USD']\naccounts: {default: {}}\nspider_addr: '" + listener.Addr().String() + "'\nrun_policy:\n  - name: automatic-live-ts\n    capital_weight: 0.5\n    run_timeframes: [1m]\n"
+	body := "config_version: 2\nenv: prod\ntime_start: '20240101'\ntime_end: '20240102'\nexchange: {name: mixedfixture}\nmarket_type: linear\nstake_currency: [USD]\npairs: ['ASSET1/USD:USD']\naccounts: {default: {}}\nspider_addr: '" + listener.Addr().String() + "'\nrun_policy:\n  - name: automatic-live-ts\n    capital_weight: 0.5\n    run_timeframes: [1m]\n"
 	if factoryFrames {
 		body = strings.Replace(body, "    run_timeframes: [1m]\n", "", 1)
 	}
@@ -358,6 +386,9 @@ func testMixedLiveAutomaticBinding(t *testing.T, factoryFrames bool) {
 		if len(trader.RuntimeDependencies().Strategies.CollectJobs()) != 1 {
 			return fmt.Errorf("startup lacks actual TS job")
 		}
+		if _, ok := biz.GetOdMgrWithState(trader.RuntimeDependencies().Trading, "default").(*biz.HubOrderMgr); !ok {
+			return fmt.Errorf("the TS part of a mixed live account must use HubOrderMgr, got %T", biz.GetOdMgrWithState(trader.RuntimeDependencies().Trading, "default"))
+		}
 		return nil
 	})
 	session.close()
@@ -413,5 +444,42 @@ func TestMixedLiveTSAccountPrecancelledGroupOpensNoResources(t *testing.T) {
 	err := session.runMixedLiveTSAccount(ctx, nil, "default", func(context.Context, *live.CryptoTrader) error { started = true; return nil })
 	if !errors.Is(err, context.Canceled) || started || session.process != nil || session.storage != nil || session.exchange != nil {
 		t.Fatalf("cancelled group allocated account resources or started source: %v", err)
+	}
+}
+
+// A mixed account shares one account quote source between the TS Hub manager and
+// the factor runner. The factor runner requires a quote observed after its
+// executable time (factor/runner/account_sink.go), so the mixed path must never
+// install execution.ReuseRecentQuotes as that source: the runtime registers the
+// bridge's QuoteContext first and the first registration wins.
+func TestMixedLiveQuoteSourceIsFresh(t *testing.T) {
+	// Mixed accounts reuse account quotes (ReuseRecentQuotes); the factor runner
+	// must mark its reads with its executable time so a reused quote observed
+	// earlier is refetched (execution.WithQuoteNotBefore).
+	src, err := os.ReadFile("../factor/runner/account_sink.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(src), "execution.WithQuoteNotBefore(ctx, sp.ExecutableAt)") {
+		t.Fatal("factor runner quote reads must carry their executable time")
+	}
+}
+
+// Mixed accounts no longer build SharedOrderMgr in live: the runtime refuses the
+// legacy bridge outside backtest mode.
+func TestMixedLiveRejectsSharedOrderBridge(t *testing.T) {
+	dir := t.TempDir()
+	adapter, err := runner.NewPaperAdapter(decimal.NewFromInt(1000), decimal.Zero, decimal.Zero)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unit := execution.Instrument{ID: "BTC/USD", Version: "v1", Valuation: "linear_perpetual", SettlementCurrency: "USD", QuantityStep: decimal.RequireFromString("0.1"), ContractSize: decimal.NewFromInt(1), PriceTick: decimal.NewFromInt(1), MoneyScale: 3}
+	bridge := &biz.SharedOrderBridgeConfig{Version: "v1", Instruments: map[string]execution.Instrument{unit.ID: unit}, Strategies: map[string]biz.SharedStrategyBinding{"ts": {ID: "ts", MaxNotional: decimal.NewFromInt(1)}}, Risk: execution.PortfolioRisk{StrategyGrossLimits: map[execution.StrategyID]decimal.Decimal{"ts": decimal.NewFromInt(1)}}, IntentTTLMS: 1000, Quote: func(string, int64) (execution.VisibleQuote, error) { return execution.VisibleQuote{}, nil }}
+	key := execution.AccountKey{VenueSessionIdentity: dir, Account: "default", SettlementDomain: "USD"}
+	p := runtimepkg.NewProcess()
+	t.Cleanup(p.Close)
+	_, err = p.NewRuntime(runtimepkg.Options{Mode: core.RunModeLive, Env: core.RunEnvProd, AccountOwnerKey: &key, SharedMarketData: true, SharedExecution: &biz.SharedExecutionOptions{StorePath: filepath.Join(dir, "execution.db"), SenderLeaseDir: filepath.Join(dir, "leases"), Adapter: adapter, AuthoritativeSnapshot: true}, SharedOrderBridge: bridge})
+	if err == nil || !strings.Contains(err.Error(), "backtest-only") {
+		t.Fatalf("live SharedOrderBridge accepted: %v", err)
 	}
 }

@@ -118,7 +118,7 @@ func (h *apiHandlers) postStratCall(c *fiber.Ctx) error {
 		}
 	}
 	if stg == nil {
-		return errors.New("no job running with strategy: " + strategy)
+		return fiber.NewError(fiber.StatusBadRequest, "no job running with strategy: "+strategy)
 	}
 	if stg.OnPostApi != nil {
 		var liveMode bool
@@ -182,7 +182,7 @@ func (h *apiHandlers) postStratCall(c *fiber.Ctx) error {
 		}
 		return err_
 	} else {
-		return errors.New("OnPostApi not implement for strategy: " + strategy)
+		return fiber.NewError(fiber.StatusBadRequest, "OnPostApi not implement for strategy: "+strategy)
 	}
 }
 

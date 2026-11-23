@@ -271,8 +271,11 @@ func TestBanexgReportsOnlyOfferUnknownIdentityRecovery(t *testing.T) {
 			if index == 0 && (report.ExternalOrder == nil || report.ExternalOrder.Symbol != "BTC/USDT:USDT" || !errors.Is(report.Err, sql.ErrNoRows)) {
 				t.Fatal("unknown identity lost complete-query hint", report)
 			}
-			if index == 1 && (report.ExternalOrder != nil || report.Err == nil) {
-				t.Fatal("conflicting known identity offered external recovery", report)
+			// Our client ID with an exchange ID the receipt has not recorded yet is
+			// our own order: the stream outran the submit receipt (an instant fill).
+			// It wakes recovery of that order and is never offered as external.
+			if index == 1 && (report.ExternalOrder != nil || report.Err != nil || report.OrderID != stored.Intent.ID) {
+				t.Fatal("stream report racing the submit receipt was not assigned to its order", report)
 			}
 		case <-time.After(time.Second):
 			t.Fatal("private hint translation stalled")

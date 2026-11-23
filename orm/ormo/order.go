@@ -17,7 +17,6 @@ import (
 	"github.com/banbox/banbot/btime"
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
-	"github.com/banbox/banbot/execution"
 	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/utils"
@@ -349,7 +348,7 @@ func (i *InOutOrder) UpdateFee(price float64, forEnter bool) *errs.Error {
 	if !forEnter {
 		exOrder = i.Exit
 	}
-	fee, err := execution.LegacyOrderFee(exchange, i.Symbol, &exOrder.OrderType,
+	fee, err := exg.OrderFee(exchange, i.Symbol, &exOrder.OrderType,
 		exOrder.Side, exOrder.Filled, price)
 	if err != nil {
 		return err

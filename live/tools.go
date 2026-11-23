@@ -1,7 +1,6 @@
 package live
 
 import (
-	"fmt"
 	"sort"
 	"strings"
 
@@ -10,9 +9,7 @@ import (
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/strat"
-	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
-	"go.uber.org/zap"
 )
 
 type TradeCloseRequest struct {
@@ -28,14 +25,11 @@ func CloseOrdersWithRuntimeDeps(deps biz.RuntimeDeps, request TradeCloseRequest)
 	if deps.Core == nil || deps.Clock == nil || deps.ConfigView() == nil {
 		return nil, errs.NewMsg(core.ErrBadConfig, "runtime core, clock, and config are required")
 	}
-	if deps.Core.EnvReal && deps.SharedExecution == nil {
-		return nil, errs.NewMsg(core.ErrBadConfig, "production close requires a bound execution account; the legacy close sender is retired")
+	if !closeExecutionManaged(deps) {
+		return nil, errs.NewMsg(core.ErrBadConfig, "closing orders requires a bound execution account (embedded or Hub); the legacy live order manager was removed")
 	}
-	if deps.SharedExecution != nil && request.Exchange {
+	if request.Exchange {
 		return nil, errs.NewMsg(core.ErrBadConfig, "execution close requires attributed strategy orders; raw venue position closing is not supported")
-	}
-	if deps.Exchange == nil && deps.SharedExecution == nil {
-		return nil, errs.NewMsg(core.ErrExgNotInit, "runtime exchange is required")
 	}
 	accounts := deps.AccountConfigs()
 	if len(accounts) == 0 {
@@ -45,12 +39,10 @@ func CloseOrdersWithRuntimeDeps(deps biz.RuntimeDeps, request TradeCloseRequest)
 	if err != nil {
 		return nil, err
 	}
-	if deps.SharedExecution != nil {
-		if !closeAccountsMatchOwner(selected, deps.SharedExecution.AccountKey().Account) {
-			return nil, errs.NewMsg(core.ErrBadConfig, "close account does not match the bound execution owner")
-		}
+	if !closeAccountsMatchOwner(selected, closeOwnerAccount(deps)) {
+		return nil, errs.NewMsg(core.ErrBadConfig, "close account does not match the bound execution owner")
 	}
-	if !request.Exchange && (deps.Orders == nil || deps.Trading == nil) {
+	if deps.Orders == nil || deps.Trading == nil {
 		return nil, errs.NewMsg(core.ErrBadConfig, "runtime orders and trading state are required")
 	}
 	pairs, strategies := closeFilter(request.Pairs), closeFilter(request.Strategies)
@@ -61,16 +53,6 @@ func CloseOrdersWithRuntimeDeps(deps biz.RuntimeDeps, request TradeCloseRequest)
 			Source: biz.RemoteSourceCLI, Actor: "cli", Account: account, Action: biz.RemoteActionCloseOrder,
 			All: true, Confirmed: request.Confirmed, ExitTag: core.ExitTagCli,
 			ExecClose: func() (int, int, *errs.Error) {
-				if deps.SharedExecution != nil {
-					return closeLocalOrdersWithRuntimeDeps(deps, account, pairs, strategies)
-				}
-				if err := cancelPendingOrdersWithRuntimeDeps(deps, account, pairs); err != nil {
-					return 0, 0, err
-				}
-				if request.Exchange {
-					closed, err := closePositionsWithRuntimeDeps(deps, account, pairs)
-					return closed, 0, err
-				}
 				return closeLocalOrdersWithRuntimeDeps(deps, account, pairs, strategies)
 			},
 		})
@@ -112,70 +94,13 @@ func closeSelectedAccounts(accounts map[string]*config.AccountConfig, filter map
 	return result, nil
 }
 
-func cancelPendingOrdersWithRuntimeDeps(deps biz.RuntimeDeps, account string, pairs map[string]bool) *errs.Error {
-	params := map[string]interface{}{banexg.ParamAccount: account, banexg.ParamSettleCoins: deps.ConfigView().StakeCurrency}
-	orders, err := deps.Exchange.FetchOpenOrders("", 0, 1000, params)
-	if err != nil {
-		return err
-	}
-	algoParams := map[string]interface{}{banexg.ParamAccount: account, banexg.ParamAlgoOrder: true, banexg.ParamSettleCoins: deps.ConfigView().StakeCurrency}
-	if algo, algoErr := deps.Exchange.FetchOpenOrders("", 0, 1000, algoParams); algoErr != nil {
-		deps.Logger().Error("fetch open algo orders fail", zap.Error(algoErr))
-	} else {
-		orders = append(orders, algo...)
-	}
-	for _, order := range orders {
-		if order == nil || (len(pairs) > 0 && !pairs[order.Symbol]) || (order.Status != "open" && order.Status != "partially_filled") {
-			continue
-		}
-		_, cancelErr := deps.Exchange.CancelOrder(order.ID, order.Symbol, map[string]interface{}{banexg.ParamAccount: account})
-		if cancelErr != nil && cancelErr.Code != errs.CodeOrderNotFound && cancelErr.Code != errs.CodeOrderNotCancelable {
-			deps.Logger().Error("cancel order fail", zap.String("account", account), zap.String("order_id", order.ID), zap.Error(cancelErr))
-		}
-	}
-	return nil
-}
-
-func closePositionsWithRuntimeDeps(deps biz.RuntimeDeps, account string, pairs map[string]bool) (int, *errs.Error) {
-	positions, err := deps.Exchange.FetchAccountPositions(nil, map[string]interface{}{banexg.ParamAccount: account, banexg.ParamSettleCoins: deps.ConfigView().StakeCurrency})
-	if err != nil {
-		return 0, err
-	}
-	closed := 0
-	for _, position := range positions {
-		if position == nil || (len(pairs) > 0 && !pairs[position.Symbol]) {
-			continue
-		}
-		side := banexg.OdSideSell
-		params := map[string]interface{}{banexg.ParamAccount: account, banexg.ParamClientOrderId: fmt.Sprintf("bancli_%d_%d", deps.Clock.TimeMS(), closed)}
-		if deps.Core.IsContract {
-			params[banexg.ParamPositionSide] = "LONG"
-			if position.Side == banexg.PosSideShort {
-				params[banexg.ParamPositionSide], side = "SHORT", banexg.OdSideBuy
-			}
-		}
-		if _, err := deps.Exchange.CreateOrder(position.Symbol, banexg.OdTypeMarket, side, position.Contracts, 0, params); err != nil {
-			return closed, err
-		}
-		closed++
-	}
-	return closed, nil
-}
-
 func closeLocalOrdersWithRuntimeDeps(deps biz.RuntimeDeps, account string, pairs, strategies map[string]bool) (int, int, *errs.Error) {
-	if deps.SharedExecution != nil {
-		if _, ok := deps.Trading.OrderManager(account).(*biz.SharedOrderMgr); !ok {
-			return 0, 0, errs.NewMsg(core.ErrRunTime, "execution order manager is not initialized: %s", account)
-		}
-	} else {
-		biz.InitLiveOrderMgrWithRuntimeDeps(deps, nil)
-		manager := deps.Trading.LiveManager(account)
-		if manager == nil {
-			return 0, 0, errs.NewMsg(core.ErrRunTime, "live order manager is not initialized: %s", account)
-		}
-		if _, _, _, err := manager.SyncExgOrders(); err != nil {
-			return 0, 0, err
-		}
+	// Closing goes only through the execution-backed manager's attributed
+	// orders (biz.IOrderMgr.ExitOrder); never through raw venue calls.
+	switch deps.Trading.OrderManager(account).(type) {
+	case *biz.SharedOrderMgr, *biz.HubOrderMgr:
+	default:
+		return 0, 0, errs.NewMsg(core.ErrRunTime, "execution order manager is not initialized: %s", account)
 	}
 	openOrders, lock := deps.Orders.GetOpenODs(account)
 	lock.Lock()
@@ -187,6 +112,20 @@ func closeLocalOrdersWithRuntimeDeps(deps biz.RuntimeDeps, account string, pairs
 	}
 	lock.Unlock()
 	return biz.CloseAccOrdersWithState(deps.Trading, account, matched, &strat.ExitReq{Tag: core.ExitTagCli, Force: true})
+}
+
+// closeExecutionManaged reports whether orders are owned by an execution
+// account: embedded (SharedExecution) or reached through a Hub bridge
+// (embedded HubOrderMgr, or a remote Hub robot).
+func closeExecutionManaged(deps biz.RuntimeDeps) bool {
+	return deps.SharedExecution != nil || deps.HubOrderBridge != nil
+}
+
+func closeOwnerAccount(deps biz.RuntimeDeps) string {
+	if deps.SharedExecution != nil {
+		return deps.SharedExecution.AccountKey().Account
+	}
+	return deps.HubOrderBridge.Account.Account
 }
 
 // closeAccountsMatchOwner reports whether every selected account is the one

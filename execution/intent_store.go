@@ -68,6 +68,11 @@ type StrategyAcceptedEvent struct {
 	CommandID string
 	AtMS      int64
 	Metadata  *TimeSeriesMetadata `json:",omitempty"`
+	// Rejected is set only when the owner itself terminated the entry of this
+	// lot: with a refusal code when the plan was refused (pending_isolation.go),
+	// or with OCOSimultaneousReason / OCOFilledSiblingReason when an OCO sibling
+	// won the group (pending_oco.go).
+	Rejected string `json:",omitempty"`
 }
 
 // SaveProjectionMetadata atomically persists a projection's compact index and

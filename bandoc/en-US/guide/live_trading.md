@@ -66,7 +66,7 @@ Edit market, database and strategy settings in `config.local.yml`. Defaults load
 
 The exchange network proxy comes from `exchange.<name>.proxy`: `no` disables the proxy; when empty, the environment/system proxy is detected once at startup and the result is shared by all exchanges, so a system proxy change after detection needs a restart. See [Network Proxy](./configuration.md#network-proxy).
 
-For live simulation select `env: dry_run` and `execution.funding_policy: explicit-zero`. For production select `env: prod`, real credentials and `required-stream`. Both require instrument units, capital and risk declarations. Time-series-only entries additionally require `execution.store` and `sender_lease_dir`. Legacy `fatal_stop` and dynamic `leverage` (including account-level settings) have not migrated to shared live execution and are rejected. Do not simply switch an old configuration to prod. See [Configuration](./configuration.md) and [Shared account setup](./execution.md#configure-and-start).
+For live simulation select `env: dry_run` and `execution.funding_policy: explicit-zero`. For production select `env: prod`, real credentials and `required-stream`. Both require instrument units, capital and risk declarations. Time-series-only entries additionally require `execution.store` and `sender_lease_dir`. `leverage` (including account-level settings) is the fixed leverage of every account instrument and is set at the venue by the Hub account owner, while a per-order leverage in a strategy request is still rejected; `fatal_stop` is enforced by the account owner on equity loss. Do not simply switch an old configuration to prod. See [Configuration](./configuration.md) and [Shared account setup](./execution.md#configure-and-start).
 
 Several strategies/robots can share one physical account through one Hub while retaining strategy budgets and attribution. Do not run independent senders for that account. Use separate subaccounts for independent capital boundaries. Keep strategy IDs stable and distinct across robots, and check attribution and budgets after startup.
 
@@ -86,21 +86,43 @@ Do not start hub and spider on the same socket. Address errors from a missing Hu
 
 Stopping one robot does not automatically close positions. Hub continues existing pending orders and protection. After Hub restart, accounts await robot reauthentication and local protection is inactive until authentication. Preserve the execution directory and journals, and follow [Recovery](./execution.md#restart-and-recovery). A running process alone does not prove account recovery.
 
+An embedded production time-series robot (custom `execution.live_provider`) runs its own account without a separate Hub process and always uses the in-process Hub order manager (`execution.ts_facade` was removed and is rejected); so does the time-series part of a mixed factor + time-series robot (`SharedOrderMgr` is backtest-only). Accounts upgraded from the legacy facade (mixed accounts included) have their legacy checkpoints imported automatically, once, on first start; legacy data is left untouched and rolling back to the old facade is no longer available. See [Execution](./execution.md).
+
 ## Order types in live trading
 
 Stop-Limit entries, OCO groups, multi-level take-profit and trailing stops work in both backtest and live trading (including live simulation). See [custom strategies](./strat_custom.md) for the fields and the [backtesting guide](./backtest.md#matching-semantics) for backtest matching. Live caveats:
 
-- Stop-loss, take-profit and trailing stop are attached only after the order is **fully entered**, not during partial fills.
-- With `ExgStopLoss` / `ExgTakeProfit` set to `false`, no exchange conditional order is placed and a local price monitor triggers instead; there is no protection while the program is stopped or quotes are unavailable.
-- A trailing stop prefers the exchange's native trailing order; if the callback percent exceeds the exchange limit or the order is rejected, it degrades to local price monitoring instead of failing the order.
-- When one pending entry in an OCO group fills, the unfilled siblings are cancelled with exit tag `oco_cancel`.
+- Stop-loss, take-profit and trailing stop follow `execution.protection_mode`: `software` (default) lets the execution engine monitor prices, `native_preferred` prefers exchange conditional orders when the adapter supports them and otherwise falls back to engine monitoring; trailing stops are still monitored by the engine. While the program is stopped the Hub keeps handling the protections already on the account; local protection is inactive while the Hub is unavailable.
+- When one pending entry in an OCO group fills, the unfilled siblings are cancelled with exit tag `oco_cancel`; on the default Hub path, of several members executable in the same tick only the earliest-created one is kept (see [custom strategies](./strat_custom.md)).
 - Multi-level take-profit places the next level only after the previous one fills; `MoveSLToBreakeven` moves the remaining stop-loss once that level fills.
 - The backtest-only `data_gap` / `delist` exit tags and the `bt_*` cost keys do not apply to live trading.
+
+## Live capability support matrix
+
+Live trading and live simulation always go through the execution module (Hub or embedded account). The old live order stack was deleted; capabilities that only existed in it are handled as follows: **supported**; **refused** (an error at startup or request time); **ignored** (the configuration key has no effect and a warning is logged at startup, startup is not blocked). Migration notes for each item are in the repository file `doc/project/05_biz_orders_live.md` ("support matrix").
+
+| Capability | Status | Current behaviour |
+|---|---|---|
+| Hedge (dual-side) position mode | Refused | Hub account registration check fails; positions must be one-way |
+| Spot / margin spot (`market_type: spot`/`margin`) | Refused | Startup fails with `market_type "spot" is not supported by the execution path (linear USDT-margined perpetuals only)…`; only linear perpetuals are supported |
+| Inverse and dated contracts | Refused | Rejected at startup or by the adapter |
+| Testnet (`env: test`) | Refused | Startup fails with `testnet live trading is not supported by the execution path; use env: dry_run or prod` |
+| Per-order leverage, automatic tiered-leverage downsizing | Refused | Leverage is declared per account and applied by the Hub account owner; per-order leverage is rejected and orders beyond the venue tier are rejected by the venue |
+| Dynamic `UpdatePairs`, pair rotation (`pairlists`, `pairmgr.cron`) | Refused / ignored | Pairs are fixed at startup; `UpdatePairs` returns an error, rotation keys are ignored with a warning |
+| Margin top-up `margin_add_rate`, `charge_on_bomb` | Ignored | Warning; risk is handled by owner admission and the loss breaker |
+| Limit placement `put_limit_secs`, `odbook_ttl` | Ignored | Warning; limit prices follow `order_mode`, `limit_vol_secs`, `near_limit_bps` |
+| Account polling `account_pull_secs` | Ignored | Warning; balances and equity come from the account owner |
+| Live-vs-backtest comparison `bt_in_live` | Ignored | Warning; the feature was removed |
+| Wallet snapshot persistence | Refused (not written) | `wallet_snapshot` is no longer written |
+| Stop-loss/take-profit/trailing stop, multi-level take-profit, OCO, order editing | Supported | See the previous section; `execution.protection_mode` selects engine monitoring or preferring native conditional orders |
+| `fatal_stop` | Supported (semantics changed) | Enforced by the account owner on equity drawdown with a persisted pause |
+| `take_over_strat` | Supported (partial) | External takeover records are restored as strategy orders; user-opened exchange positions are no longer auto-tracked |
+| `close_on_stuck` | Supported | Closes through the account order manager when no candle arrives in time (only accounts whose manager is registered in this runtime) |
 
 ## 4. Notifications, DashBoard, and Monitoring
 ### Notifications and remote control
 
-Configure WeCom, email or Telegram through `rpc_channels`. See [Notifications](./notifications.md) for templates, filtering and SMTP examples. Both `min_intv_secs` and `retry_delay` use seconds. Delivery is asynchronous: receiving a message does not establish a new fill; check account state and logs during deployment.
+Configure WeCom, email or Telegram through `rpc_channels`. See [Notifications](./notifications.md) for templates, filtering and SMTP examples. Both `min_intv_secs` and `retry_delay` use seconds. On shared-account robots with several accounts, Telegram runs only on the first tradable account (see [Notifications](./notifications.md#shared-account-hub-robots)). Delivery is asynchronous: receiving a message does not establish a new fill; check account state and logs during deployment.
 
 Custom Telegram mode uses `token` and `chat_id`. Dashboard relay mode without a token provides a binding link in startup logs. An empty `secret` is generated; a manually supplied secret must be UUID v4. Relay mode needs outbound HTTPS and TCP 6788 to `www.banbot.site`; custom mode needs Telegram API access and can use a channel `proxy`.
 
@@ -121,7 +143,7 @@ api_server:
       acc_roles:
         user1: admin  # user1 corresponds to the user key in accounts
 ```
-`api_server` is hosted by the time-series CryptoTrader startup path; do not assume a pure-factor Hub run starts the same Dashboard. `/api/bot` uses JWT and account operations require roles. `/api/kline`, `/api/kline/csv/upload` and `/api/ws` are outside the JWT group; protect these paths at the reverse proxy for public deployment.
+In shared-account live trading, time-series, factor and mixed robots start `api_server` only when they have exactly one account (with several accounts it is not started and a warning is logged); requests need `X-Authorization: Bearer <token>` and `X-Account`, see [Shared accounts and Hub](./execution.md#operation-and-troubleshooting). `/api/bot` uses JWT and account operations require roles. `/api/kline`, `/api/kline/csv/upload` and `/api/ws` are outside the JWT group; protect these paths at the reverse proxy for public deployment.
 
 The web service mentioned above is started with HTTP. It is recommended that you set the `bind_ip` to the local or intranet IP of the server to prevent unauthorized access.
 
@@ -139,19 +161,6 @@ If you need to expose the dashboard to the Internet, it is strongly recommended 
 ![image](/img/dash_login_en.png)
 > When starting a live trading locally or after SSH port forwarding, the access URL for the robot is always 127.0.0.1:[port], where [port] is the value of `api_server.port`.  
 > If you use an nginx reverse proxy, these two addresses should be the ones accessed from nginx, such as "https://bot.myserver.com/8001"
-
-### Live Trading vs Backtesting Comparison
-Banbot supports scheduled execution of backtests with the same configuration during live trading. It compares each backtest order record with the open orders in live trading and the exchange positions one by one to check for issues such as missed or incorrectly placed orders in live trading:
-
-```yaml
-# Live trading backtest configuration
-bt_in_live:
-  cron: "0 0 * * *"  # Backtest frequency, cron expression, executed at 0:00 daily
-  account: "account1"
-  mail_to: ["trader@company.com"]  # The comparison results will be sent to the configured email addresses
-mail:  # You also need to set up the email sender; for details, refer to the email notification above
-  enable: true
-```
 
 ### Monitoring
 `check_bot.sh` checks only for a configuration filename in process arguments. The `live` argument below matches `live.yml`, not the `trade` subcommand. Also monitor Hub recovery warnings, account freezes and market-data availability; process liveness does not prove protection is active.

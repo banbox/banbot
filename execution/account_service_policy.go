@@ -145,6 +145,9 @@ func (b *SharedAccountBorrow) VisibleQuote(ctx context.Context, id string, now i
 			if err := ctx.Err(); err != nil {
 				return err
 			}
+			if atMS, ok := quoteNotBefore(ctx); ok {
+				ownerCtx = WithQuoteNotBefore(ownerCtx, atMS)
+			}
 			var err error
 			q, err = market.quote(ownerCtx, id, now)
 			return err

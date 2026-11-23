@@ -166,7 +166,7 @@ var sqliteStatements = map[storageOperation]string{
 	opInsertMigration:             "INSERT INTO exec_migration(account,id,source_hash,source_version,schema_version,state,payload) VALUES(?,?,?,?,?,'pending',?)",
 	opFreezeAccount:               "UPDATE exec_account SET frozen=1 WHERE account=?",
 	opReadMigrationState:          "SELECT state,source_hash FROM exec_migration WHERE account=? AND id=?",
-	opCountMigrationDestination:   "SELECT (SELECT count(*) FROM exec_plan WHERE account=?)+(SELECT count(*) FROM exec_lot WHERE account=?)+(SELECT count(*) FROM exec_position WHERE account=?)+(SELECT count(*) FROM exec_strategy WHERE account=?)+(SELECT count(*) FROM exec_event WHERE account=?)+(SELECT count(*) FROM exec_checkpoint WHERE account=? AND kind='strategy' AND NOT(strategy='account-risk' AND name='policy-v1'))+(SELECT count(*) FROM exec_external_position WHERE account=?)",
+	opCountMigrationDestination:   "SELECT (SELECT count(*) FROM exec_plan WHERE account=?)+(SELECT count(*) FROM exec_lot WHERE account=?)+(SELECT count(*) FROM exec_position WHERE account=?)+(SELECT count(*) FROM exec_strategy WHERE account=?)+(SELECT count(*) FROM exec_event WHERE account=?)+(SELECT count(*) FROM exec_checkpoint WHERE account=? AND kind='strategy' AND strategy<>'account-risk')+(SELECT count(*) FROM exec_external_position WHERE account=?)",
 	opReadAccountGenesis:          "SELECT cash,unassigned,pnl_reclassification,checkpoint FROM exec_account WHERE account=?",
 	opInsertStrategy:              "INSERT INTO exec_strategy(account,strategy,cash) VALUES(?,?,?)",
 	opInsertLot:                   "INSERT INTO exec_lot(account,strategy,id,quantity,payload) VALUES(?,?,?,?,?)",

@@ -7,11 +7,8 @@ import (
 
 	"github.com/banbox/banbot/biz"
 	"github.com/banbox/banbot/config"
-	"github.com/banbox/banbot/core"
-	"github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/rpc"
 	"github.com/banbox/banexg"
-	"github.com/banbox/banexg/log"
 	"go.uber.org/zap"
 )
 
@@ -33,67 +30,35 @@ type accCheckResult struct {
 
 const marginModeMixed = "mixed"
 
-func CheckLiveAccounts() {
-	if !core.EnvReal {
-		return
+// VerifyLiveAccountsWithRuntimeDeps runs the same startup account checks but
+// reports failures instead of setting NoTrade. The execution-backed order
+// managers do not honour AccountConfig.NoTrade, so a failed check there must
+// stop startup (fail closed) rather than be recorded in an ignored flag.
+func VerifyLiveAccountsWithRuntimeDeps(deps biz.RuntimeDeps) error {
+	failed := checkLiveAccountsWithRuntimeDeps(deps)
+	if len(failed) == 0 {
+		return nil
 	}
-	for account, cfg := range config.Accounts {
-		if cfg.NoTrade {
-			continue
-		}
-		res := &accCheckResult{balanceSummary: balanceUnknownSummary()}
-		balances := fetchAccountBalance(account, res)
-		if balances != nil {
-			balances.Init()
-			res.balanceSummary, res.errors = buildBalanceSummary(balances, config.WalletAmounts)
-		}
-		access, err := exg.Default.FetchAccountAccess(map[string]interface{}{
-			banexg.ParamAccount: account,
-			banexg.ParamBalance: balances,
-		})
-		if err != nil {
-			res.errors = append(res.errors, fmt.Sprintf(accMsg("account_access_fetch_failed", "Account access check failed: %v"), err))
-		}
-		applyAccountAccess(res, access)
-		if res.marginMode == "" && (core.IsContract || core.Market == banexg.MarketMargin) {
-			res.marginMode = fetchMarginModeFromPositions(account)
-		}
-		if res.tradeKnown && !res.tradeAllowed {
-			res.errors = append(res.errors, accMsg("no_trade_permission", "No trading permission"))
-		}
-		if res.withdrawKnown && res.withdrawAllowed {
-			res.warns = append(res.warns, accMsg("withdraw_permission_enabled", "Withdrawals enabled"))
-		}
-		if res.ipKnown && res.ipAny {
-			res.warns = append(res.warns, accMsg("ip_any_warning", "IP restriction: any"))
-		}
-		summary := buildAccSummary(account, res)
-		log.Info("live account check", zap.String("acc", account), zap.String("summary", summary))
-		if len(res.warns) > 0 {
-			warnMsg := "WARN: " + strings.Join(res.warns, "; ")
-			log.Warn("live account check", zap.String("acc", account), zap.String("warn", warnMsg))
-		}
-		if len(res.errors) > 0 {
-			errMsg := "ERROR: " + strings.Join(res.errors, "; ")
-			log.Error("account disabled", zap.String("acc", account), zap.String("error", errMsg))
-			rpc.SendMsg(map[string]interface{}{
-				"type":    rpc.MsgTypeException,
-				"account": account,
-				"status":  errMsg,
-			})
-			cfg.NoTrade = true
-		}
+	accounts := make([]string, 0, len(failed))
+	for account := range failed {
+		accounts = append(accounts, account)
 	}
+	sort.Strings(accounts)
+	parts := make([]string, 0, len(accounts))
+	for _, account := range accounts {
+		parts = append(parts, account+": "+failed[account])
+	}
+	return fmt.Errorf("live account check failed: %s", strings.Join(parts, " | "))
 }
 
-// CheckLiveAccountsWithRuntimeDeps validates the accounts owned by one live
-// runtime. The explicit path never consults the package-level exchange,
-// account map, wallet expectations, or notification session.
-func CheckLiveAccountsWithRuntimeDeps(deps biz.RuntimeDeps) {
+// checkLiveAccountsWithRuntimeDeps returns the failing accounts with their
+// error text.
+func checkLiveAccountsWithRuntimeDeps(deps biz.RuntimeDeps) map[string]string {
+	failed := make(map[string]string)
 	state := deps.Core
 	exchange := deps.Exchange
 	if state == nil || !state.EnvReal || exchange == nil {
-		return
+		return failed
 	}
 	logger := deps.Logger()
 	cfg := deps.ConfigView()
@@ -108,32 +73,7 @@ func CheckLiveAccountsWithRuntimeDeps(deps biz.RuntimeDeps) {
 		if accountCfg == nil || accountCfg.NoTrade {
 			continue
 		}
-		res := &accCheckResult{balanceSummary: balanceUnknownSummary()}
-		balances := fetchAccountBalanceWithExchange(exchange, account, res)
-		if balances != nil {
-			balances.Init()
-			res.balanceSummary, res.errors = buildBalanceSummary(balances, expected)
-		}
-		access, err := exchange.FetchAccountAccess(map[string]interface{}{
-			banexg.ParamAccount: account,
-			banexg.ParamBalance: balances,
-		})
-		if err != nil {
-			res.errors = append(res.errors, fmt.Sprintf(accMsg("account_access_fetch_failed", "Account access check failed: %v"), err))
-		}
-		applyAccountAccess(res, access)
-		if res.marginMode == "" && (state.IsContract || state.Market == banexg.MarketMargin) {
-			res.marginMode = fetchMarginModeFromPositionsWithExchange(exchange, account, settleCoins)
-		}
-		if res.tradeKnown && !res.tradeAllowed {
-			res.errors = append(res.errors, accMsg("no_trade_permission", "No trading permission"))
-		}
-		if res.withdrawKnown && res.withdrawAllowed {
-			res.warns = append(res.warns, accMsg("withdraw_permission_enabled", "Withdrawals enabled"))
-		}
-		if res.ipKnown && res.ipAny {
-			res.warns = append(res.warns, accMsg("ip_any_warning", "IP restriction: any"))
-		}
+		res := runAccountCheck(exchange, account, expected, settleCoins, state.IsContract || state.Market == banexg.MarketMargin)
 		summary := buildAccSummary(account, res)
 		logger.Info("live account check", zap.String("acc", account), zap.String("summary", summary))
 		if len(res.warns) > 0 {
@@ -147,13 +87,58 @@ func CheckLiveAccountsWithRuntimeDeps(deps biz.RuntimeDeps) {
 				"account": account,
 				"status":  errMsg,
 			})
-			accountCfg.NoTrade = true
+			failed[account] = strings.Join(res.errors, "; ")
 		}
 	}
+	return failed
 }
 
-func fetchAccountBalance(account string, res *accCheckResult) *banexg.Balances {
-	return fetchAccountBalanceWithExchange(exg.Default, account, res)
+// AccountCheckReport is the outcome of the startup checks for one account.
+// Texts never contain credentials.
+type AccountCheckReport struct {
+	Errors  []string
+	Warns   []string
+	PosMode string
+	Summary string
+}
+
+// CheckAccountWithExchange runs the legacy startup checks (trade permission,
+// withdraw/IP warnings, balance against expected wallet amounts, account
+// access capability) for one account on an explicit exchange and reports the
+// result without side effects such as notifications or NoTrade flags.
+func CheckAccountWithExchange(exchange banexg.BanExchange, account string, expected map[string]float64, settleCoins []string, marginAware bool) AccountCheckReport {
+	res := runAccountCheck(exchange, account, expected, settleCoins, marginAware)
+	return AccountCheckReport{Errors: res.errors, Warns: res.warns, PosMode: res.posMode, Summary: buildAccSummary(account, res)}
+}
+
+func runAccountCheck(exchange banexg.BanExchange, account string, expected map[string]float64, settleCoins []string, marginAware bool) *accCheckResult {
+	res := &accCheckResult{balanceSummary: balanceUnknownSummary()}
+	balances := fetchAccountBalanceWithExchange(exchange, account, res)
+	if balances != nil {
+		balances.Init()
+		res.balanceSummary, res.errors = buildBalanceSummary(balances, expected)
+	}
+	access, err := exchange.FetchAccountAccess(map[string]interface{}{
+		banexg.ParamAccount: account,
+		banexg.ParamBalance: balances,
+	})
+	if err != nil {
+		res.errors = append(res.errors, fmt.Sprintf(accMsg("account_access_fetch_failed", "Account access check failed: %v"), err))
+	}
+	applyAccountAccess(res, access)
+	if res.marginMode == "" && marginAware {
+		res.marginMode = fetchMarginModeFromPositionsWithExchange(exchange, account, settleCoins)
+	}
+	if res.tradeKnown && !res.tradeAllowed {
+		res.errors = append(res.errors, accMsg("no_trade_permission", "No trading permission"))
+	}
+	if res.withdrawKnown && res.withdrawAllowed {
+		res.warns = append(res.warns, accMsg("withdraw_permission_enabled", "Withdrawals enabled"))
+	}
+	if res.ipKnown && res.ipAny {
+		res.warns = append(res.warns, accMsg("ip_any_warning", "IP restriction: any"))
+	}
+	return res
 }
 
 func fetchAccountBalanceWithExchange(exchange banexg.BanExchange, account string, res *accCheckResult) *banexg.Balances {
@@ -316,10 +301,6 @@ func boolSummary(val bool, known bool, yes string, no string) string {
 		return yes
 	}
 	return no
-}
-
-func fetchMarginModeFromPositions(account string) string {
-	return fetchMarginModeFromPositionsWithExchange(exg.Default, account, config.StakeCurrency)
 }
 
 func fetchMarginModeFromPositionsWithExchange(exchange banexg.BanExchange, account string, settleCoins []string) string {

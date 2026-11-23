@@ -116,6 +116,11 @@ func runHubWith(args *config.CmdArgs, socket string, startup data.SpiderStartupF
 	if listenErr != nil {
 		return errs.New(core.ErrRunTime, listenErr)
 	}
+	// Robots only learn that an operation failed; the reason stays in this
+	// host's private log.
+	server.SetErrorObserver(func(path string, err error) {
+		log.Warn("hub operation failed", zap.String("operation", path), zap.Error(err))
+	})
 	defer func() {
 		if closeErr := server.Close(); closeErr != nil {
 			if result != nil {

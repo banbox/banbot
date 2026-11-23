@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"sync"
 	"time"
 
@@ -20,23 +21,36 @@ import (
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banexg/errs"
 	"github.com/shopspring/decimal"
+	"go.uber.org/zap"
 )
 
 // HubOrderBridgeConfig contains a remote command port, never an account owner,
 // private exchange adapter, or execution ledger. StatePath is a private robot
 // outbox/projection journal; the Hub remains the only execution authority.
 type HubOrderBridgeConfig struct {
-	Client        *execution.HubClient
+	Client        execution.HubPort
 	Account       execution.AccountKey
 	Bridge        SharedOrderBridgeConfig
 	WriterID      string
 	ExpectedEpoch map[execution.StrategyID]uint64
 	StatePath     string
+	// LocalAccount marks a bridge whose Client is an in-process execution.LocalHubPort
+	// serving the SAME account this runtime already borrows as SharedExecution
+	// (biz.HubOrderMgr on an embedded account, execution.EmbeddedHub). It is the only case in which a
+	// Hub bridge may coexist with SharedExecution; no SharedOrderMgr is built.
+	// Nobody else observes public feeds then, so this manager forwards closed
+	// bars to the account itself (UpdateByDataSeries).
+	LocalAccount bool
 }
 
 func (c *HubOrderBridgeConfig) Validate() error {
-	if c == nil || c.Client == nil || c.WriterID == "" || !filepath.IsAbs(c.StatePath) {
+	if c == nil || hubPortNil(c.Client) || c.WriterID == "" || !filepath.IsAbs(c.StatePath) {
 		return errors.New("biz: incomplete Hub order bridge")
+	}
+	if c.LocalAccount {
+		if _, ok := c.Client.(*execution.LocalHubPort); !ok {
+			return errors.New("biz: local-account Hub bridge requires an in-process Hub port")
+		}
 	}
 	if err := c.Account.Validate(); err != nil {
 		return err
@@ -60,6 +74,16 @@ type hubFrozenCommand struct {
 	OrderID int64
 	Results []execution.TimeSeriesExitResult
 	Done    bool
+	// Rejected marks a command the owner refused before committing anything.
+	// It is finished: resending it unchanged would be refused forever.
+	Rejected bool `json:",omitempty"`
+	// Imported marks a command carried over from the legacy SharedOrderMgr
+	// checkpoint (hub_order_legacy_import.go). It is finished history: a retry
+	// with the same ID replays OrderIDs without comparing hashes (the facades
+	// hash different encodings) and without sending, and resumeCommands never
+	// resends it. OrderIDs are the legacy record's orders.
+	Imported bool    `json:",omitempty"`
+	OrderIDs []int64 `json:",omitempty"`
 }
 type hubOrderJournal struct {
 	OrderKinds        map[string]map[string]execution.IntentKind
@@ -75,25 +99,36 @@ type hubOrderJournal struct {
 	Commands          map[string]*hubFrozenCommand
 	Cursor            int64
 	Lots              map[string]*hubProjectedLot
+	// Plans/Followups hold the robot-side take-profit ladder and OCO state
+	// (hub_order_ladder.go). Additive: journals without them load unchanged.
+	Plans     map[string]*hubLotPlan  `json:",omitempty"`
+	Followups map[string]*hubFollowup `json:",omitempty"`
+	// Migrated records the one-time import of the SharedOrderMgr checkpoint
+	// (hub_order_legacy_import.go). Additive and informational.
+	Migrated *hubLegacyMigration `json:",omitempty"`
 }
 
 type HubOrderMgr struct {
-	deps       RuntimeDeps
-	config     HubOrderBridgeConfig
-	callback   FnOdCb
-	mu         sync.Mutex
-	journal    hubOrderJournal
-	jobs       map[sharedJobIdentity]*strat.StratJob
-	pending    map[string]execution.PendingDefinition
-	lastError  error
-	polling    bool
-	started    bool
-	delivering bool
-	pollDone   chan struct{}
-	ctx        context.Context
-	cancel     context.CancelFunc
-	done       chan struct{}
-	lockFile   *os.File
+	deps     RuntimeDeps
+	config   HubOrderBridgeConfig
+	callback FnOdCb
+	mu       sync.Mutex
+	journal  hubOrderJournal
+	jobs     map[sharedJobIdentity]*strat.StratJob
+	archiver orderArchiver
+	pending  map[string]execution.PendingDefinition
+	backoff  map[string]*hubBackoff // per-lot follow-up retry state, memory only
+	// takeoverWarned dedupes takeover warnings; memory only.
+	takeoverWarned map[string]bool
+	lastError      error
+	polling        bool
+	started        bool
+	delivering     bool
+	pollDone       chan struct{}
+	ctx            context.Context
+	cancel         context.CancelFunc
+	done           chan struct{}
+	lockFile       *os.File
 }
 
 func hubRandomID() (string, error) {
@@ -108,7 +143,10 @@ func NewHubOrderMgr(deps RuntimeDeps, cfg *HubOrderBridgeConfig, callback FnOdCb
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	if deps.SharedExecution != nil || deps.SharedOrderBridge != nil || deps.Core == nil || deps.Core.BackTestMode || deps.Orders == nil || deps.Trading == nil || deps.Clock == nil {
+	// A local-account bridge reads the same account the runtime borrows; any
+	// other SharedExecution/SharedOrderBridge would mean a second facade.
+	localOwner := cfg.LocalAccount && deps.SharedExecution != nil && deps.SharedExecution.AccountKey() == cfg.Account
+	if (deps.SharedExecution != nil && !localOwner) || deps.SharedOrderBridge != nil || deps.Core == nil || deps.Core.BackTestMode || deps.Orders == nil || deps.Trading == nil || deps.Clock == nil {
 		return nil, errors.New("biz: Hub bridge requires isolated live/dry-run runtime dependencies")
 	}
 	c := *cfg
@@ -166,6 +204,11 @@ func NewHubOrderMgr(deps RuntimeDeps, cfg *HubOrderBridgeConfig, callback FnOdCb
 			m.journal.Writers[b.ID] = &hubWriter{Expected: expected}
 		}
 		if err == nil {
+			// First start of an embedded account: import the legacy facade state
+			// before the journal exists on disk (see hub_order_legacy_import.go).
+			err = m.importLegacyCheckpoint(ctx)
+		}
+		if err == nil {
 			err = m.saveLocked()
 		}
 	}
@@ -198,6 +241,22 @@ func NewHubOrderMgr(deps RuntimeDeps, cfg *HubOrderBridgeConfig, callback FnOdCb
 			return nil, errors.New("biz: Hub journal writer was fenced or lost commands")
 		}
 		writer.Lease = lease
+	}
+	if policy, active, e := timeSeriesLossStop(deps); e != nil {
+		cancel()
+		return nil, e
+	} else if active {
+		if e = c.Client.SetLossStopPolicy(ctx, c.Account, policy); e != nil {
+			cancel()
+			return nil, e
+		}
+	}
+	// Account-level admission limits are authoritative in the owner; each robot
+	// registers its own under its stable writer id and the owner keeps the most
+	// restrictive of all registrants (see execution/admission_policy.go).
+	if e := c.Client.SetAdmissionPolicy(ctx, c.Account, c.WriterID, timeSeriesAdmissionPolicy(deps)); e != nil {
+		cancel()
+		return nil, e
 	}
 	if m.journal.OrderKinds == nil {
 		m.journal.OrderKinds = map[string]map[string]execution.IntentKind{}
@@ -311,14 +370,56 @@ func (m *HubOrderMgr) LastError() error { m.mu.Lock(); defer m.mu.Unlock(); retu
 func (m *HubOrderMgr) CleanUp() *errs.Error { m.cancel(); <-m.done; return nil }
 
 func (m *HubOrderMgr) resumeCommands() error {
+	// The owner accepts a strategy's commands only with a strictly increasing
+	// sequence, so unsent frozen commands are resent in sequence order (several
+	// can be pending after exits were frozen without sending).
+	pending := make([]*hubFrozenCommand, 0, len(m.journal.Commands))
 	for _, command := range m.journal.Commands {
-		if !command.Done {
-			if err := m.sendLocked(command); err != nil {
-				return err
-			}
+		if !command.Done && !command.Imported {
+			pending = append(pending, command)
+		}
+	}
+	sort.SliceStable(pending, func(i, j int) bool { return hubCommandSequence(pending[i]) < hubCommandSequence(pending[j]) })
+	for _, command := range pending {
+		m.logResend(command)
+		if err := m.sendLocked(command); err != nil && !errors.Is(err, errSharedEntryRejected) {
+			return err
 		}
 	}
 	return nil
+}
+
+func hubCommandSequence(c *hubFrozenCommand) uint64 {
+	if c.Pending != nil {
+		return c.Pending.StrategySequence
+	}
+	if c.Exit != nil {
+		return c.Exit.StrategySequence
+	}
+	return 0
+}
+
+// logResend records that a restart or retry resends a frozen command, so a late
+// fill from an old attempt is traceable. Age is measured from the time-series
+// signal time (metadata CreatedMS); it is omitted when the command carries none.
+func (m *HubOrderMgr) logResend(command *hubFrozenCommand) {
+	fields := []zap.Field{zap.Int64("order_id", command.OrderID)}
+	kind := "exit"
+	if command.Pending != nil {
+		kind = string(command.Pending.Action)
+		fields = append(fields, zap.String("lot", string(command.Pending.Lot)))
+		if md := command.Pending.Metadata; md != nil && md.CreatedMS > 0 {
+			nowMS := time.Now().UnixMilli()
+			if m.deps.Clock != nil {
+				nowMS = m.deps.Clock.TimeMS()
+			}
+			fields = append(fields, zap.Duration("age", time.Duration(nowMS-md.CreatedMS)*time.Millisecond))
+		}
+	} else if command.Exit != nil {
+		fields = append(fields, zap.String("strategy", string(command.Exit.Strategy)))
+	}
+	fields = append(fields, zap.String("kind", kind))
+	m.deps.Logger().Info("hub resends a frozen command", fields...)
 }
 func (m *HubOrderMgr) sendLocked(command *hubFrozenCommand) error {
 	var err error
@@ -327,6 +428,26 @@ func (m *HubOrderMgr) sendLocked(command *hubFrozenCommand) error {
 	} else {
 		command.Results, err = m.config.Client.ApplyTimeSeriesExit(m.ctx, m.config.Account, *command.Exit)
 	}
+	if errors.Is(err, execution.ErrVenueMinimum) {
+		command.Done, command.Rejected = true, true
+		m.deps.Logger().Warn("hub rejected a command below the venue minimum; it is dropped, not retried", zap.Int64("order_id", command.OrderID), zap.Bool("exit", command.Exit != nil))
+		if saveErr := m.saveLocked(); saveErr != nil {
+			return saveErr
+		}
+		return errSharedEntryRejected
+	}
+	// Only a NEW entry is dropped for the other refusals (risk/exposure/margin,
+	// price tick, spot short, self-cross): the owner refused it before committing
+	// anything and would refuse the same frozen command every time. An exit, edit
+	// or protection change is never dropped here; it stays fail-closed.
+	if code, ok := execution.RejectionCode(err); ok && command.Pending != nil && command.Pending.Action == execution.PendingCreate {
+		command.Done, command.Rejected = true, true
+		m.deps.Logger().Warn("hub rejected an entry; it is dropped, not retried", zap.String("reason", code), zap.Int64("order_id", command.OrderID), zap.String("lot", string(command.Pending.Lot)))
+		if saveErr := m.saveLocked(); saveErr != nil {
+			return saveErr
+		}
+		return errSharedEntryRejected
+	}
 	if err != nil {
 		return err
 	}
@@ -334,13 +455,21 @@ func (m *HubOrderMgr) sendLocked(command *hubFrozenCommand) error {
 	return m.saveLocked()
 }
 func (m *HubOrderMgr) nextLocked(strategy execution.StrategyID) (string, uint64, uint64, error) {
+	return m.nextSeqLocked(strategy, true)
+}
+
+// nextSeqLocked allocates the next command id and sequence. With resume it
+// first retries unacknowledged frozen commands (a lost acknowledgement blocks
+// newer commands); without it the caller only journals and sends nothing.
+func (m *HubOrderMgr) nextSeqLocked(strategy execution.StrategyID, resume bool) (string, uint64, uint64, error) {
 	w := m.journal.Writers[strategy]
 	if w == nil || w.Sequence == ^uint64(0) {
 		return "", 0, 0, errors.New("biz: Hub writer sequence unavailable")
 	}
-	// A lost acknowledgement blocks newer commands until its frozen body is retried.
-	if err := m.resumeCommands(); err != nil {
-		return "", 0, 0, err
+	if resume {
+		if err := m.resumeCommands(); err != nil {
+			return "", 0, 0, err
+		}
 	}
 	w.Sequence++
 	m.journal.Serial++
@@ -430,11 +559,20 @@ func (m *HubOrderMgr) enterLocked(exs *orm.ExSymbol, tf string, req *strat.Enter
 	key := string(b.ID) + "/entry/" + req.CommandID
 	if req.CommandID != "" {
 		if cmd := m.journal.Commands[key]; cmd != nil {
+			if cmd.Imported {
+				if len(cmd.OrderIDs) == 0 {
+					return 0, errSharedEntryRejected
+				}
+				return cmd.OrderIDs[0], nil
+			}
 			if cmd.Hash != hash {
 				return 0, errors.New("biz: Hub command ID reused")
 			}
 			if !cmd.Done {
 				err = m.sendLocked(cmd)
+			}
+			if cmd.Rejected {
+				return 0, errSharedEntryRejected
 			}
 			return cmd.OrderID, err
 		}
@@ -442,7 +580,7 @@ func (m *HubOrderMgr) enterLocked(exs *orm.ExSymbol, tf string, req *strat.Enter
 	copy := *req
 	copy.StratName = name
 	defaults := makeRuntimeOrderConfig(m.deps, m.deps.DefaultAccount)
-	if m.deps.Core.EnvReal && (copy.Leverage != 0 || defaults.accountLeverage != 0) {
+	if m.deps.Core.EnvReal && copy.Leverage != 0 && copy.Leverage != defaults.accountLeverage {
 		return 0, errors.New("biz: Hub leverage changes are unsupported")
 	}
 	if copy.Leverage == 0 {
@@ -473,6 +611,7 @@ func (m *HubOrderMgr) enterLocked(exs *orm.ExSymbol, tf string, req *strat.Enter
 	if copy.Limit > 0 && copy.StopBars == 0 {
 		copy.StopBars = defaults.stopEnterBars
 	}
+	roundEntryLimits(&copy, instrument.PriceTick)
 	snapshot, err := m.config.Client.Snapshot(m.ctx, m.config.Account)
 	if err != nil {
 		return 0, err
@@ -492,13 +631,27 @@ func (m *HubOrderMgr) enterLocked(exs *orm.ExSymbol, tf string, req *strat.Enter
 			state.Orders[hubLotKey(p.Order.Strategy, p.Order.Lot)] = &sharedTSOrder{PendingOrder: p.Order, StrategyName: n}
 		}
 	}
-	gate := SharedOrderMgr{deps: m.deps, jobs: m.jobs}
-	allowed, err := gate.allowEntry(&state, snapshot, exs, tf, &copy)
+	if _, active, _ := timeSeriesLossStop(m.deps); active {
+		status, err := m.config.Client.LossStopStatus(m.ctx, m.config.Account)
+		if err != nil {
+			return 0, err
+		}
+		if err = applyLossStopPause(m.deps, status); err != nil {
+			return 0, err
+		}
+	}
+	allowed, err := admitTimeSeriesEntry(m.deps, timeSeriesJobPolicies(m.jobs, exs.Symbol, tf), &state, snapshot, exs, tf, &copy)
 	if err != nil {
 		return 0, err
 	}
 	if !allowed {
 		return 0, errSharedEntryRejected
+	}
+	// Ladder / OCO are orchestrated by the robot from the first rung and the
+	// group id; a request that cannot be expressed is refused, never dropped.
+	plan, err := newHubLotPlan(&copy, q.Bid.Add(q.Ask).Div(decimal.NewFromInt(2)).InexactFloat64())
+	if err != nil {
+		return 0, hubRejectLadderPlan(m, name, exs.Symbol, req.Tag, err)
 	}
 	nav := snapshot.SyntheticStrategyCash[b.ID]
 	for _, lot := range snapshot.Lots {
@@ -519,12 +672,14 @@ func (m *HubOrderMgr) enterLocked(exs *orm.ExSymbol, tf string, req *strat.Enter
 		key = string(b.ID) + "/entry/" + commandID
 	}
 	// Positive random facade IDs avoid collisions between robots sharing an account.
+	// 52 bits keep them exact in JSON consumers that read numbers as float64
+	// (browsers): a larger ID is rounded there and no longer names the order.
 	random, err := hubRandomID()
 	if err != nil {
 		return 0, err
 	}
 	var orderID int64
-	for _, c := range []byte(random[:15]) {
+	for _, c := range []byte(random[:13]) {
 		orderID = orderID*16 + int64(slices.Index([]byte("0123456789abcdef"), c))
 	}
 	orderID++
@@ -538,17 +693,51 @@ func (m *HubOrderMgr) enterLocked(exs *orm.ExSymbol, tf string, req *strat.Enter
 		info[k] = v
 	}
 	command, err := BridgeTimeSeriesEntryCommand(c, exs, tf, orderID, &copy, m.config.Bridge.OrderPolicy, info)
+	if err == nil && command.Create != nil {
+		// The owner refuses an order below the venue minimum, and a refused
+		// frozen command stops this robot. Size is a property of the request,
+		// not of the account, so it is checked here before anything is frozen.
+		steps := command.Create.QuantitySteps
+		if steps < instrument.MinSteps || instrument.Notional(steps, c.ReferencePrice).LessThan(instrument.MinNotional) {
+			err = errEntrySizeRejected
+		}
+	}
+	if errors.Is(err, errEntrySizeRejected) {
+		// Nothing was frozen or sent: give the unused command identity back.
+		m.journal.Writers[b.ID].Sequence--
+		m.journal.Serial--
+		m.deps.Logger().Warn("entry rejected: size below the tradable minimum or above the strategy allowance",
+			zap.String("strategy", name), zap.String("symbol", exs.Symbol), zap.String("tag", req.Tag),
+			zap.String("reference_price", c.ReferencePrice.String()), zap.String("min_notional", instrument.MinNotional.String()), zap.Int64("min_steps", instrument.MinSteps))
+		return 0, errSharedEntryRejected
+	}
 	if err != nil {
 		return 0, err
 	}
 	command.StrategyEpoch, command.StrategySequence = epoch, sequence
 	frozen := &hubFrozenCommand{Hash: hash, Pending: &command, OrderID: orderID}
 	m.journal.Commands[key] = frozen
+	if plan != nil {
+		if m.journal.Plans == nil {
+			m.journal.Plans = map[string]*hubLotPlan{}
+		}
+		m.journal.Plans[hubLotKey(b.ID, lot)] = plan
+	}
+	previousAdmission := m.journal.Admission
 	m.journal.Admission = state.Admission
 	if err = m.saveLocked(); err != nil {
 		return 0, err
 	}
-	return orderID, m.sendLocked(frozen)
+	err = m.sendLocked(frozen)
+	if errors.Is(err, errSharedEntryRejected) {
+		// The owner refused the entry before committing anything: it must not
+		// use up this bar's open-order capacity.
+		m.journal.Admission = previousAdmission
+		if saveErr := m.saveLocked(); saveErr != nil {
+			return 0, saveErr
+		}
+	}
+	return orderID, err
 }
 func sharedHash(v any) (string, error) {
 	body, err := json.Marshal(v)
@@ -575,6 +764,11 @@ func (m *HubOrderMgr) exit(pairs, tf string, req *strat.ExitReq) ([]*ormo.InOutO
 	m.started = true
 	results, err := m.exitLocked(pairs, tf, req)
 	m.mu.Unlock()
+	if errors.Is(err, errSharedEntryRejected) {
+		// The owner refused the reduction (below the venue minimum): the
+		// position is unchanged and no order view is returned.
+		return nil, nil
+	}
 	if err == nil {
 		err = m.poll(false)
 	}
@@ -590,8 +784,18 @@ func (m *HubOrderMgr) exit(pairs, tf string, req *strat.ExitReq) ([]*ormo.InOutO
 	return ods, nil
 }
 func (m *HubOrderMgr) exitLocked(pairs, tf string, req *strat.ExitReq) ([]execution.TimeSeriesExitResult, error) {
-	if m.lastError != nil {
-		return nil, m.lastError
+	return m.exitLockedMode(pairs, tf, req, true)
+}
+
+// exitLockedMode is exitLocked; with send=false the exit is only frozen into the
+// journal (same key, hash, CommandID and sequence as the normal path) so a
+// restart resends it. A duplicate with the same hash is not frozen twice.
+func (m *HubOrderMgr) exitLockedMode(pairs, tf string, req *strat.ExitReq, send bool) ([]execution.TimeSeriesExitResult, error) {
+	// A stopped robot or an unsendable older frozen command must not lose this
+	// exit: it is still journaled (not sent) and the cause is returned.
+	var deferred error
+	if send && m.lastError != nil {
+		deferred, send = m.lastError, false
 	}
 	name, b, err := m.strategy(req.StratName)
 	if err != nil {
@@ -607,16 +811,31 @@ func (m *HubOrderMgr) exitLocked(pairs, tf string, req *strat.ExitReq) ([]execut
 	key := string(b.ID) + "/exit/" + req.CommandID
 	if req.CommandID != "" {
 		if cmd := m.journal.Commands[key]; cmd != nil {
+			if cmd.Imported {
+				results := make([]execution.TimeSeriesExitResult, 0, len(cmd.OrderIDs))
+				for _, id := range cmd.OrderIDs {
+					results = append(results, execution.TimeSeriesExitResult{OrderID: id})
+				}
+				return results, nil
+			}
 			if cmd.Hash != hash {
 				return nil, errors.New("biz: Hub exit ID reused")
 			}
-			if !cmd.Done {
+			if !cmd.Done && send {
 				err = m.sendLocked(cmd)
+			}
+			if err == nil {
+				err = deferred
 			}
 			return cmd.Results, err
 		}
 	}
-	id, epoch, seq, err := m.nextLocked(b.ID)
+	if send {
+		if e := m.resumeCommands(); e != nil {
+			deferred, send = e, false
+		}
+	}
+	id, epoch, seq, err := m.nextSeqLocked(b.ID, false)
 	if err != nil {
 		return nil, err
 	}
@@ -629,6 +848,17 @@ func (m *HubOrderMgr) exitLocked(pairs, tf string, req *strat.ExitReq) ([]execut
 		copy.CommandID = id
 		key = string(b.ID) + "/exit/" + id
 	}
+	if copy.Limit > 0 {
+		orderSymbol := ""
+		if copy.OrderID > 0 {
+			if od := m.order(copy.OrderID); od != nil {
+				orderSymbol = od.Symbol
+			}
+		}
+		if tick, ok := exitTick(m.config.Bridge.Instruments, pairs, orderSymbol); ok {
+			copy.Limit = roundToTick(copy.Limit, tick)
+		}
+	}
 	command, err := BridgeTimeSeriesExitCommand(b.ID, name, pairs, tf, &copy)
 	if err != nil {
 		return nil, err
@@ -636,8 +866,11 @@ func (m *HubOrderMgr) exitLocked(pairs, tf string, req *strat.ExitReq) ([]execut
 	command.StrategyEpoch, command.StrategySequence = epoch, seq
 	frozen := &hubFrozenCommand{Hash: hash, Exit: &command}
 	m.journal.Commands[key] = frozen
-	if err = m.saveLocked(); err == nil {
+	if err = m.saveLocked(); err == nil && send {
 		err = m.sendLocked(frozen)
+	}
+	if err == nil {
+		err = deferred
 	}
 	return frozen.Results, err
 }
@@ -668,10 +901,23 @@ func (m *HubOrderMgr) RelayOrders(ods []*ormo.InOutOrder) *errs.Error {
 	}
 	return nil
 }
-func (m *HubOrderMgr) UpdateByDataSeries(_ []*ormo.InOutOrder, _ *orm.DataSeries) *errs.Error {
+func (m *HubOrderMgr) UpdateByDataSeries(_ []*ormo.InOutOrder, evt *orm.DataSeries) *errs.Error {
 	m.mu.Lock()
 	m.started = true
 	m.mu.Unlock()
+	if m.config.LocalAccount && evt != nil && evt.Closed && !evt.IsWarmUp {
+		// No Hub host observes this robot's feeds: persist the closed bar so
+		// StopBars expiry advances, as SharedOrderMgr does for its account.
+		if observer, ok := m.config.Client.(interface {
+			ObservePendingFeed(context.Context, execution.AccountKey, execution.PendingFeedObservation) (bool, error)
+		}); ok {
+			if _, err := observer.ObservePendingFeed(m.ctx, m.config.Account, execution.PendingFeedObservation{
+				Feed: execution.PendingFeedID(sharedFeedKey(evt.Sid, evt.TimeFrame)), EndMS: evt.EndMS, Closed: true,
+			}); err != nil {
+				return sharedBridgeError(err)
+			}
+		}
+	}
 	if err := m.poll(false); err != nil {
 		return sharedBridgeError(err)
 	}
@@ -734,6 +980,7 @@ func (m *HubOrderMgr) ProcessOrders(job *strat.StratJob) ([]*ormo.InOutOrder, []
 		m.started = true
 		m.mu.Unlock()
 		if err := m.poll(false); err != nil {
+			m.salvageQueued(job, nil, nil)
 			return nil, nil, sharedBridgeError(err)
 		}
 	}
@@ -747,30 +994,85 @@ func (m *HubOrderMgr) ProcessOrders(job *strat.StratJob) ([]*ormo.InOutOrder, []
 			}
 			continue
 		}
-		for _, r := range ent {
+		for i, r := range ent {
 			copy := *r
 			if copy.StratName == "" && job.Strat != nil {
 				copy.StratName = job.Strat.Name
 			}
 			od, err := m.EnterOrder(job.Symbol, job.TimeFrame, &copy)
 			if err != nil {
+				m.salvageQueued(job, ent[i+1:], ext)
 				return entries, exits, err
 			}
 			if od != nil {
 				entries = append(entries, od)
 			}
 		}
-		for _, r := range ext {
+		for i, r := range ext {
 			copy := *r
 			if copy.StratName == "" && job.Strat != nil {
 				copy.StratName = job.Strat.Name
 			}
 			ods, err := m.exit(job.Symbol.Symbol, job.TimeFrame, &copy)
 			if err != nil {
+				m.salvageQueued(job, nil, ext[i+1:])
 				return entries, exits, err
 			}
 			exits = append(exits, ods...)
 		}
 	}
 	return entries, exits, nil
+}
+
+// salvageQueued runs when ProcessOrders fails. The request that failed is
+// already journaled (or never was and is the caller's error); every other
+// request the strategy queued (the unprocessed rest of the drained batch plus
+// anything still queued) was already acknowledged to the strategy, so exits are
+// frozen into the journal without sending and a restart resends them. Entries
+// are dropped with a warning: a fresh entry after a failure would be stale.
+func (m *HubOrderMgr) salvageQueued(job *strat.StratJob, ent []*strat.EnterReq, ext []*strat.ExitReq) {
+	qe, qx := job.DrainOrderRequests()
+	ent, ext = append(ent, qe...), append(ext, qx...)
+	for _, r := range ent {
+		if r == nil {
+			continue
+		}
+		m.deps.Logger().Warn("hub dropped a queued entry after an order processing failure",
+			zap.String("strategy", r.StratName), zap.String("tag", r.Tag), zap.String("command_id", r.CommandID))
+	}
+	if len(ext) == 0 || job.Symbol == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, r := range ext {
+		if r == nil {
+			continue
+		}
+		copy := *r
+		if copy.StratName == "" && job.Strat != nil {
+			copy.StratName = job.Strat.Name
+		}
+		if _, err := m.exitLockedMode(job.Symbol.Symbol, job.TimeFrame, &copy, false); err != nil {
+			m.deps.Logger().Error("hub could not journal a queued exit after an order processing failure",
+				zap.String("strategy", copy.StratName), zap.String("tag", copy.Tag), zap.String("command_id", copy.CommandID), zap.Error(err))
+			continue
+		}
+		m.deps.Logger().Warn("hub froze a queued exit without sending after an order processing failure; it is resent on restart",
+			zap.String("strategy", copy.StratName), zap.String("tag", copy.Tag), zap.String("command_id", copy.CommandID))
+	}
+}
+
+// hubPortNil reports a nil port, including a typed-nil pointer stored in the
+// interface (a nil *HubClient or *LocalHubPort would otherwise pass == nil).
+func hubPortNil(p execution.HubPort) bool {
+	switch v := p.(type) {
+	case nil:
+		return true
+	case *execution.HubClient:
+		return v == nil
+	case *execution.LocalHubPort:
+		return v == nil
+	}
+	return false
 }

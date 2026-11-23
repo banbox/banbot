@@ -53,7 +53,7 @@ func TestAccountBookQuoteRejectsInvalidDepth(t *testing.T) {
 	now := time.Now().UnixMilli()
 	for name, mutate := range map[string]func(*banexg.OrderBook){
 		"stale":   func(b *banexg.OrderBook) { b.TimeStamp = now - 1000 },
-		"future":  func(b *banexg.OrderBook) { b.TimeStamp = now + 1 },
+		"future":  func(b *banexg.OrderBook) { b.TimeStamp = now + accountClockSkewMS + 1 },
 		"missing": func(b *banexg.OrderBook) { b.Bids = nil },
 		"empty":   func(b *banexg.OrderBook) { b.Asks = banexg.NewOdBookSide(false, 1, nil) },
 		"crossed": func(b *banexg.OrderBook) { b.Asks = banexg.NewOdBookSide(false, 1, [][2]float64{{90, 100}}) },
@@ -73,6 +73,15 @@ func TestAccountBookQuoteRejectsInvalidDepth(t *testing.T) {
 	quote, err := accountBookQuote(book, now, time.Second)
 	if err != nil || !quote.Bid.Equal(intentPrice("100")) || quote.ValidUntilMS != now+1000 {
 		t.Fatal(quote, err)
+	}
+	// A host clock slightly behind the exchange: the book is accepted as
+	// observed at the receive time, so quote invariants (AtMS <= ReceivedMS)
+	// hold and its validity starts from the receive time.
+	ahead := depthBook(100)
+	ahead.TimeStamp = now + 240
+	quote, err = accountBookQuote(ahead, now, time.Second)
+	if err != nil || quote.AtMS != now || quote.ReceivedMS != now || quote.ValidUntilMS != now+1000 {
+		t.Fatalf("small clock skew must be tolerated: %+v %v", quote, err)
 	}
 }
 
@@ -96,8 +105,11 @@ func TestAccountMarketStreamExecutesEntryAndProtectionWithoutRobot(t *testing.T)
 		t.Fatal(err)
 	}
 	defer stream.Close()
-	if exchange.depth != 0 {
-		t.Fatal("account depth must use the SDK default rather than an unsupported venue depth")
+	// The small depth subscribes a self-contained partial-depth stream (no REST
+	// re-seeding weight); unsupported venues fall back to the SDK default (see
+	// TestWatchAccountDepthFallsBackToDefaultWhenUnsupported).
+	if exchange.depth != accountQuoteDepthLevels {
+		t.Fatal("account depth wake-ups must request the small depth", exchange.depth)
 	}
 	robot.Release()
 	observer := service.Borrow()
@@ -337,5 +349,26 @@ func TestAccountMarketStreamIsolatesSlowAndFailedSnapshots(t *testing.T) {
 			t.Fatal("snapshot did not recover")
 		case <-time.After(time.Millisecond):
 		}
+	}
+}
+
+type unsupportedDepthExchange struct {
+	accountDepthExchange
+	asked []int
+}
+
+func (e *unsupportedDepthExchange) WatchOrderBooks(symbols []string, depth int, params map[string]any) (chan *banexg.OrderBook, *errs.Error) {
+	e.asked = append(e.asked, depth)
+	if depth != 0 {
+		return nil, errs.NewMsg(errs.CodeParamInvalid, "depth not offered")
+	}
+	return e.accountDepthExchange.WatchOrderBooks(symbols, depth, params)
+}
+
+func TestWatchAccountDepthFallsBackToDefaultWhenUnsupported(t *testing.T) {
+	exchange := &unsupportedDepthExchange{accountDepthExchange: accountDepthExchange{updates: make(chan *banexg.OrderBook, 1)}}
+	updates, err := watchAccountDepth(exchange, []string{"BTC/USDT:USDT"}, context.Background())
+	if err != nil || updates == nil || len(exchange.asked) != 2 || exchange.asked[0] != accountQuoteDepthLevels || exchange.asked[1] != 0 {
+		t.Fatal("unsupported small depth must fall back to the SDK default", exchange.asked, err)
 	}
 }

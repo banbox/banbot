@@ -16,11 +16,20 @@ import (
 	"github.com/banbox/banbot/orm"
 	runtimepkg "github.com/banbox/banbot/runtime"
 	"github.com/banbox/banbot/strat"
+	"github.com/banbox/banexg/log"
 	"github.com/shopspring/decimal"
+	"go.uber.org/zap"
 )
 
 func mixedLiveAccountConfig(cfg *config.Config, account string, policies []*config.RunPolicyConfig) *config.Config {
+	root := cfg
 	cfg = cfg.Clone()
+	// Config.Clone deliberately omits the notification sections; carry them as
+	// deep copies so this account's runtime session can build its channels.
+	if dropped := cfg.CopyNotifications(root, account, notificationInboundOwner(root, account)); len(dropped) > 0 {
+		log.Warn("telegram channels are not started for this account: one bot token allows a single command listener per process, it runs on the first trading account",
+			zap.String("account", account), zap.Strings("channels", dropped), zap.String("owner", notificationInboundAccount(root)))
+	}
 	cfg.Accounts = map[string]*config.AccountConfig{account: cfg.Accounts[account]}
 	cfg.RunPolicy = nil
 	for _, p := range policies {
@@ -28,6 +37,52 @@ func mixedLiveAccountConfig(cfg *config.Config, account string, policies []*conf
 	}
 	return cfg
 }
+
+// notificationInboundAccount names the one account runtime of this process that
+// may open inbound notification listeners (telegram command polling or the
+// dashboard bot connection): the first tradable account by name. Outbound-only
+// channels (wework, mail) are enabled for every account.
+func notificationInboundAccount(root *config.Config) string {
+	if root == nil {
+		return ""
+	}
+	owner := ""
+	for name, acc := range root.Accounts {
+		if acc != nil && acc.NoTrade {
+			continue
+		}
+		if owner == "" || name < owner {
+			owner = name
+		}
+	}
+	return owner
+}
+
+func notificationInboundOwner(root *config.Config, account string) bool {
+	if root != nil && len(root.Accounts) <= 1 {
+		return true
+	}
+	return notificationInboundAccount(root) == account
+}
+
+// accountDashboardConfig returns the api_server section for one account's
+// runtime. Config.Clone leaves it out, and each account of an execution robot
+// has a runtime of its own: with several accounts they would all bind the same
+// port, so the dashboard is only served by single-account robots.
+func accountDashboardConfig(root *config.Config, account string) *config.APIServerConfig {
+	if root == nil || root.APIServer == nil || !root.APIServer.Enable {
+		return nil
+	}
+	if len(root.Accounts) != 1 {
+		log.Warn("api_server is not started: an execution robot serves the dashboard for a single account only", zap.String("account", account), zap.Int("accounts", len(root.Accounts)))
+		return nil
+	}
+	server := *root.APIServer
+	server.CORSOrigins = slices.Clone(root.APIServer.CORSOrigins)
+	server.Users = slices.Clone(root.APIServer.Users)
+	return &server
+}
+
 func mixedLivePolicies(spec *config.RunSpec, account string) []*config.RunPolicyConfig {
 	if spec == nil {
 		return nil
@@ -56,8 +111,8 @@ func (s *explicitEntrySession) prepareMixedLiveBinding(snapshot *config.Snapshot
 	u := s.runSpec.Config()
 	if u.Root.Env == core.RunEnvProd {
 		account := u.Root.Accounts[c.AccountID]
-		if len(u.Root.FatalStop) > 0 || u.Root.Leverage > 0 || account != nil && account.Leverage > 0 {
-			return nil, fmt.Errorf("mixed live: account %s legacy fatal_stop and dynamic leverage require ledger-native migration", c.AccountID)
+		if binding.Transport != nil && (u.Root.Leverage > 0 || account != nil && account.Leverage > 0) {
+			return nil, fmt.Errorf("mixed live: account %s declared leverage is applied by the Hub account owner; embedded execution providers do not support it", c.AccountID)
 		}
 	}
 	if binding.Legacy != nil {
@@ -188,7 +243,7 @@ func loadMixedLiveJobs(rt *runtimepkg.Runtime, binding *FactorLiveBinding) error
 	if err != nil {
 		return err
 	}
-	biz.InitLocalOrderMgrWithRuntimeDeps(rt.BizDeps(), nil, false)
+	biz.InitLocalOrderMgrWithRuntimeDeps(rt.BizDeps(), rt.OrderNotifyCallback(), false)
 	if _, _, err := strat.LoadStratJobsWithState(rt.Strategies, rt.Core, rt.Symbols, pairs, scores, rt.Orders); err != nil {
 		return err
 	}
@@ -234,19 +289,5 @@ func (s *explicitEntrySession) runMixedLiveTSAccount(ctx context.Context, snapsh
 		}
 		return s.runTimeSeriesExecutionAccount(ctx, snapshot, c, binding, startup)
 	}
-	cfg := mixedLiveAccountConfig(snapshot.View(), account, mixedLivePolicies(s.runSpec, account))
-	scoped := config.NewSnapshotWithDirs(cfg, snapshot.DataDir, snapshot.StrategyDir, snapshot.Location())
-	rt, err := s.newStorageRuntimeContext(ctx, scoped, core.RunModeLive, 0)
-	if err != nil {
-		return err
-	}
-	defer func() { rt.Close(); rt.Join() }()
-	trader, err := live.NewCryptoTraderWithRuntimeDeps(rt.BizDeps(), startup)
-	if err != nil {
-		return err
-	}
-	if err := trader.Run(); err != nil {
-		return err
-	}
-	return nil
+	return fmt.Errorf("%s", unsupportedLiveEnvMessage(snapshot.View().Env))
 }

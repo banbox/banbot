@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestHubTimeSeriesAtomicExitProjectionAndReplay(t *testing.T) {
@@ -41,6 +42,9 @@ func TestHubTimeSeriesAtomicExitProjectionAndReplay(t *testing.T) {
 	}
 	for i, lot := range []VirtualLotID{"first", "second"} {
 		create := tsCreate(string(lot), lot, int64(i+1), true)
+		// The Hub owner runs on the wall clock: a synthetic signal time would be
+		// refused as a stale entry.
+		create.Metadata.CreatedMS = time.Now().UnixMilli()
 		create.StrategyEpoch, create.StrategySequence = 1, uint64(i+1)
 		if _, err := client.ApplyPendingCommand(ctx, key, create); err != nil {
 			t.Fatal(err)

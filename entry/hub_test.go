@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 
@@ -130,5 +131,34 @@ func TestHubInstrumentMetadataIncludesSettlementAndValuation(t *testing.T) {
 	expected.Valuation = "spot"
 	if hubInstrumentMatches(declared, expected) {
 		t.Fatal("incompatible valuation accepted")
+	}
+}
+
+func TestHubAccountDeclaredLeverageMustFitMarginRate(t *testing.T) {
+	r, base := hubConfigFixture()
+	for _, tc := range []struct {
+		leverage int
+		margin   string
+		valid    bool
+	}{
+		{0, "0.1", true}, {5, "0.2", true}, {5, "1", true}, {5, "0.19", false}, {126, "1", false}, {-1, "1", false},
+	} {
+		c := base
+		c.Instruments = slices.Clone(base.Instruments)
+		c.Instruments[0].Leverage = tc.leverage
+		c.Risk.MarginRate = decimal.RequireFromString(tc.margin)
+		r.Configuration, _ = json.Marshal(c)
+		decoded, err := decodeHubAccountConfig(r)
+		if (err == nil) != tc.valid {
+			t.Fatalf("leverage=%d margin=%s: %v", tc.leverage, tc.margin, err)
+		}
+		if tc.valid && decoded.Instruments[0].Leverage != tc.leverage {
+			t.Fatalf("declared leverage lost in registration: %+v", decoded.Instruments[0])
+		}
+	}
+	// An undeclared leverage keeps the registration bytes of existing accounts.
+	body, _ := json.Marshal(base)
+	if strings.Contains(string(body), "Leverage") {
+		t.Fatalf("zero leverage must not change existing registration payloads: %s", body)
 	}
 }

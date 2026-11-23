@@ -15,11 +15,66 @@ import (
 )
 
 type hubProjectedLot struct {
+	// Archived is set once the closed order was copied to the trades database.
+	Archived                                               bool `json:",omitempty"`
 	Terminal                                               bool
 	Record                                                 execution.TimeSeriesProjectionRecord
 	Entered, Exited                                        int64
 	EntryCost, ExitCost, Fees, ExitFees, Realized, Funding decimal.Decimal
 	EntryMS, ExitMS                                        int64
+	// AutoExitTag is why the LAST reduction of the lot happened when the Hub
+	// owner's software/native protection (stop-loss, take-profit, ladder rung,
+	// trailing) executed it. It is captured from the owner's pending definition
+	// when that exit fill is first replayed, because the owner may drop the
+	// definition once the lot is flat. AutoExitTags is the per-reduction
+	// sequence. Explicit strategy exits carry their tag in Record.Metadata.
+	AutoExitTag  string   `json:",omitempty"`
+	AutoExitTags []string `json:",omitempty"`
+}
+
+// protectionExitTagLocked names the protection that executed the exit fill being
+// replayed. Signal: PendingOrder.LastProtection, set by the owner when it commits
+// a protection reduction and cleared when an explicit exit is installed. The
+// pending definition is the page's latest one, so it is exact for one reduction
+// per poll page, which holds because a ladder's next rung is only installed after
+// the previous one was observed. Empty means: not a protection exit, or the
+// definition is gone and nothing could be determined.
+func (m *HubOrderMgr) protectionExitTagLocked(k string, lot *hubProjectedLot) string {
+	p, ok := m.pending[k]
+	if !ok {
+		return ""
+	}
+	kind := p.Order.LastProtection
+	if kind == "" && p.Order.Exit != nil {
+		kind = p.Order.LastNativeProtection
+	}
+	var payload TimeSeriesEntryPayload
+	if kind == "" || json.Unmarshal(lot.Record.Metadata.Payload, &payload) != nil {
+		return ""
+	}
+	req := payload.Request
+	switch kind {
+	case execution.StopLossProtection:
+		if req.StopLossTag != "" {
+			return req.StopLossTag
+		}
+		return core.ExitTagStopLoss
+	case execution.TrailingProtection:
+		return core.ExitTagTrailingStop
+	case execution.TakeProfitProtection:
+		// The ladder keeps its active rung until the owner's execution of it was
+		// observed, so at replay time Index is the rung that just fired.
+		if plan := m.journal.Plans[k]; plan != nil && plan.Ladder != nil && plan.Ladder.Index >= 0 && plan.Ladder.Index < len(plan.Ladder.Rungs) {
+			if tag := plan.Ladder.Rungs[plan.Ladder.Index].Tag; tag != "" {
+				return tag
+			}
+		}
+		if req.TakeProfitTag != "" {
+			return req.TakeProfitTag
+		}
+		return core.ExitTagTakeProfit
+	}
+	return ""
 }
 
 func (m *HubOrderMgr) projectionName() string { return "hub-ts/" + m.journal.Session }
@@ -61,8 +116,12 @@ func (m *HubOrderMgr) poll(restore bool) error {
 			}
 		}
 		name := m.projectionName()
+		var takeovers []execution.StrategyID
+		if _, id := m.hubTakeoverScope(); id != "" {
+			takeovers = []execution.StrategyID{id}
+		}
 		m.mu.Unlock()
-		page, err := m.config.Client.TimeSeriesProjection(m.ctx, m.config.Account, execution.TimeSeriesProjectionRequest{Name: name, Limit: 512, Lots: keys})
+		page, err := m.config.Client.TimeSeriesProjection(m.ctx, m.config.Account, execution.TimeSeriesProjectionRequest{Name: name, Limit: 512, Lots: keys, Takeovers: takeovers})
 		if err != nil {
 			return err
 		}
@@ -195,6 +254,13 @@ func (m *HubOrderMgr) poll(restore bool) error {
 						lot.ExitCost = lot.ExitCost.Add(notional)
 						lot.ExitFees = lot.ExitFees.Add(entry.Fee)
 						lot.ExitMS = entry.AtMS
+						if event.Kind == "ExchangeFill" || event.Kind == "InternalFill" {
+							// Last reduction wins; an explicit exit resets it to "".
+							lot.AutoExitTag = m.protectionExitTagLocked(k, lot)
+							if lot.AutoExitTag != "" {
+								lot.AutoExitTags = append(lot.AutoExitTags, lot.AutoExitTag)
+							}
+						}
 					}
 					visible, e := m.viewLocked(lot, false)
 					if e != nil {
@@ -209,7 +275,7 @@ func (m *HubOrderMgr) poll(restore bool) error {
 					}
 					deliveries = append(deliveries, hubOrderDelivery{visible, kind, fmt.Sprintf("%s/%d", event.ID, entry.ID), true, isEnter})
 				}
-				if event.Kind == "StrategyAccepted" {
+				if event.Kind == "StrategyAccepted" && !hubFollowupID(accepted.CommandID) {
 					visible, e := m.viewLocked(lot, false)
 					if e != nil {
 						m.mu.Unlock()
@@ -256,9 +322,22 @@ func (m *HubOrderMgr) poll(restore bool) error {
 				l.Record = r
 			}
 		}
+		if m.journal.Cursor >= page.Snapshot.Checkpoint {
+			if e := m.adoptTakeoversLocked(page, records); e != nil {
+				m.mu.Unlock()
+				return e
+			}
+		}
 		held := map[string]int64{}
 		for _, l := range page.Snapshot.Lots {
 			held[hubLotKey(l.Strategy, l.ID)] = l.SignedSteps
+		}
+		if m.journal.Cursor >= page.Snapshot.Checkpoint {
+			// Ladder rungs / OCO siblings: owner facts are fully replayed here.
+			if e := m.orchestrateLocked(page.Snapshot); e != nil {
+				m.mu.Unlock()
+				return e
+			}
 		}
 		for key, lot := range m.journal.Lots {
 			_, active := m.pending[key]
@@ -267,6 +346,17 @@ func (m *HubOrderMgr) poll(restore bool) error {
 			if e != nil {
 				m.mu.Unlock()
 				return e
+			}
+			// A lot is history once it is flat, its entry can no longer fill and
+			// the page was fully replayed (earlier pages lack the final fills). The
+			// owner may keep the pending definition of such a lot, so Terminal is
+			// not the trigger.
+			if !lot.Archived && od.Status == ormo.InOutStatusFullExit && held[key] == 0 && m.journal.Cursor >= page.Snapshot.Checkpoint {
+				entry := m.pending[key].Order
+				entryOpen := active && !entry.Canceled && entry.Entry.State != execution.Expired && entry.Entry.State != execution.Canceled && entry.Entry.QuantitySteps > entry.Entry.FilledSteps
+				if !entryOpen {
+					lot.Archived = m.archiver.archive(m.deps, od, timeSeriesArchiveKey(m.config.Account, lot.Record.Strategy, lot.Record.Lot))
+				}
 			}
 			ods, lock := m.deps.Orders.GetOpenODs(m.deps.DefaultAccount)
 			lock.Lock()
@@ -465,12 +555,20 @@ func (m *HubOrderMgr) deliver(d hubOrderDelivery) {
 			m.callback(d.Order, d.IsEnter)
 		}
 		strat.FireOdChangeWithState(m.deps.Strategies, m.deps.DefaultAccount, d.Order, d.Kind)
-		if job != nil && job.Strat.OnOrderChange != nil {
-			job.Strat.OnOrderChange(job, d.Order, d.Kind)
+		if job != nil {
+			m.refreshJobForCallback(job, d.Order)
+			applyHedgeOff(job, d.Order, d.Kind)
+			if job.Strat.OnOrderChange != nil {
+				job.Strat.OnOrderChange(job, d.Order, d.Kind)
+			}
 		}
 	}
 	if job != nil {
 		job.WithOrderEvent(d.ID, fn)
+		// Requests queued by the callback carry event-derived command IDs and
+		// are submitted before the delivery is acknowledged, so a crash
+		// replays callback and flush with identical IDs. m.mu is not held.
+		flushCallbackOrders(&m.deps, job, m.ProcessOrders)
 	} else {
 		fn()
 	}
@@ -563,6 +661,11 @@ func (m *HubOrderMgr) viewLocked(lot *hubProjectedLot, latest bool) (*ormo.InOut
 		if kind == "take_profit" {
 			price, limit, rate, tag, key = req.TakeProfit, req.TakeProfitLimit, req.TakeProfitRate, req.TakeProfitTag, ormo.OdInfoTakeProfit
 		}
+		if plan := m.journal.Plans[hubLotKey(lot.Record.Strategy, lot.Record.Lot)]; kind == "take_profit" && price == 0 && plan != nil && plan.Ladder != nil {
+			if spec := plan.Ladder.tpSpec(); spec.Level.IsPositive() {
+				price, limit, rate = spec.Level.InexactFloat64(), spec.Limit.InexactFloat64(), spec.Rate.InexactFloat64()
+			}
+		}
 		if latest {
 			if trigger, ok := p.Order.Protections[kind]; ok {
 				limit = trigger.Conditions.Limit.InexactFloat64()
@@ -578,6 +681,15 @@ func (m *HubOrderMgr) viewLocked(lot *hubProjectedLot, latest bool) (*ormo.InOut
 		}
 	}
 	od.Info[ormo.OdInfoCallbackPct], od.Info[ormo.OdInfoActivePrice] = req.CallbackPct, req.ActivationPrice
+	// A protection-closed lot is labelled with the reason of its last reduction.
+	// Partial reductions stay untagged (a tag marks the order closed for
+	// CanClose); their sequence is kept in Info. Explicit exit tags win.
+	if len(lot.AutoExitTags) > 0 {
+		od.Info["exit_tags"] = append([]string(nil), lot.AutoExitTags...)
+	}
+	if od.ExitTag == "" && od.Status == ormo.InOutStatusFullExit {
+		od.ExitTag = lot.AutoExitTag
+	}
 	od.BindState(m.deps.Orders)
 	return od, nil
 }

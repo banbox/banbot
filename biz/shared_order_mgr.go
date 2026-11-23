@@ -14,7 +14,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
 	"github.com/banbox/banbot/data"
 	"github.com/banbox/banbot/execution"
@@ -256,8 +255,12 @@ func sharedProtectionSpecs(req strat.EnterReq) []execution.PositionProtection {
 	}
 }
 
-// SharedOrderMgr implements the existing request facade without inheriting a
-// Local/LiveOrderMgr network path. All fills and cash remain in SharedAccount.
+// SharedOrderMgr is the BACKTEST order manager of time-series strategies that
+// trade through a SharedAccount (mixed factor + time-series replay). It
+// implements the existing request facade without a Local/LiveOrderMgr network
+// path; all fills and cash remain in SharedAccount. Live and dry-run accounts
+// never build it: they use HubOrderMgr (runtime.Options rejects a
+// SharedOrderBridge outside backtest mode).
 type SharedOrderMgr struct {
 	mu                sync.Mutex
 	deps              RuntimeDeps
@@ -278,6 +281,13 @@ func NewSharedOrderMgr(deps RuntimeDeps, account *SharedAccountBorrow, config *S
 		return nil, err
 	}
 	manager := &SharedOrderMgr{deps: deps, account: account, config: config, callback: callback, jobs: map[sharedJobIdentity]*strat.StratJob{}}
+	if policy, active, err := timeSeriesLossStop(deps); err != nil {
+		return nil, err
+	} else if active {
+		if err = account.SetLossStopPolicy(account.Context(), policy); err != nil {
+			return nil, err
+		}
+	}
 	if err := account.WithState(func(s *SharedAccount) error {
 		state, err := loadSharedCheckpoint(s.Store(), account.Context(), config.Version)
 		if err != nil {
@@ -399,9 +409,6 @@ func (m *SharedOrderMgr) mutate(change func(*SharedAccount, *sharedTSCheckpoint,
 		if err != nil {
 			return err
 		}
-		if err := m.restoreTakeovers(m.account.Context(), s.Store(), &state, snapshot); err != nil {
-			return err
-		}
 		state.Serial++
 		if err := change(s, &state, snapshot, now, state.Serial); err != nil {
 			if errors.Is(err, errSharedCommandReplay) {
@@ -498,7 +505,10 @@ func (m *SharedOrderMgr) contextFor(s *SharedAccount, snapshot execution.Account
 				return IntentBridgeContext{}, err
 			}
 			now = s.SendTime(now)
-			nav = nav.Add(l.Unrealized(q.Bid.Add(q.Ask).Div(decimal.NewFromInt(2))))
+			// EquityValue, as on the Hub path: for cash-settled instruments the
+			// strategy cash has already paid the cost basis, so the lot adds its
+			// market value; for perpetuals it equals the unrealized PnL.
+			nav = nav.Add(l.EquityValue(q.Bid.Add(q.Ask).Div(decimal.NewFromInt(2))))
 		}
 	}
 	if quote.ValidUntilMS <= now {
@@ -517,13 +527,22 @@ func (m *SharedOrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.Ent
 	}
 	if m.deps.Core != nil && m.deps.Core.EnvReal {
 		defaults := makeRuntimeOrderConfig(m.deps, m.deps.DefaultAccount)
-		if req.Leverage != 0 || defaults.accountLeverage != 0 {
+		if req.Leverage != 0 && req.Leverage != defaults.accountLeverage {
 			return nil, sharedBridgeError(errors.New("biz: live execution does not support requested leverage changes"))
 		}
 	}
 	instrument, ok := m.config.Instruments[exs.Symbol]
 	if !ok {
 		return nil, sharedBridgeError(errors.New("biz: undeclared shared instrument"))
+	}
+	if _, active, _ := timeSeriesLossStop(m.deps); active {
+		status, err := m.account.LossStopStatus(m.account.Context(), m.deps.Clock.TimeMS())
+		if err != nil {
+			return nil, sharedBridgeError(err)
+		}
+		if err = applyLossStopPause(m.deps, status); err != nil {
+			return nil, sharedBridgeError(err)
+		}
 	}
 	var id int64
 	err := m.mutate(func(s *SharedAccount, state *sharedTSCheckpoint, snapshot execution.AccountSnapshot, now, serial int64) error {
@@ -610,6 +629,7 @@ func (m *SharedOrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.Ent
 		if !relay && copy.Limit > 0 && copy.StopBars == 0 {
 			copy.StopBars = defaults.stopEnterBars
 		}
+		roundEntryLimits(&copy, instrument.PriceTick)
 		c, err := m.contextFor(s, snapshot, name, instrument, lot, execution.VirtualIntentID(fmt.Sprintf("legacy-entry/%s/%d", binding.ID, id)), now, q.Bar)
 		if err != nil {
 			return err
@@ -676,79 +696,10 @@ func (m *SharedOrderMgr) enterOrder(exs *orm.ExSymbol, tf string, req *strat.Ent
 }
 
 func (m *SharedOrderMgr) allowEntry(state *sharedTSCheckpoint, snapshot execution.AccountSnapshot, exs *orm.ExSymbol, tf string, req *strat.EnterReq) (bool, error) {
-	// Admission state is staged with the request checkpoint and serialized by
-	// the account owner. Rejected or failed requests do not spend bar capacity.
-	counts := make(map[string]int)
-	held := make(map[[2]string]int64)
-	for _, lot := range snapshot.Lots {
-		held[[2]string{string(lot.Strategy), string(lot.ID)}] = lot.SignedSteps
-	}
-	openNum := 0
-	for _, record := range state.Orders {
-		pending := !record.Canceled && record.Entry.State != execution.Expired && record.Entry.State != execution.Canceled && record.Entry.QuantitySteps > record.Entry.FilledSteps
-		if held[[2]string{string(record.Strategy), string(record.Lot)}] != 0 || pending {
-			openNum++
-			counts[record.StrategyName]++
-		}
-	}
-	policies := make(map[string]*config.RunPolicyConfig)
-	if m.deps.Config != nil && m.deps.Config.View() != nil {
-		for _, policy := range m.deps.Config.View().RunPolicy {
-			if policy != nil {
-				policies[policy.Name] = policy
-			}
-		}
-	}
 	m.mu.Lock()
-	for key, job := range m.jobs {
-		if key.Symbol == exs.Symbol && key.TimeFrame == tf && job.Strat != nil && job.Strat.Policy != nil {
-			policies[key.Strategy] = job.Strat.Policy
-		}
-	}
+	jobPolicies := timeSeriesJobPolicies(m.jobs, exs.Symbol, tf)
 	m.mu.Unlock()
-	previous := state.Admission
-	gate := OrderMgr{Account: m.deps.DefaultAccount, clock: m.deps.Clock, runtimeCore: m.deps.Core, runtimeDeps: true, walletDeps: m.deps, runtimeCfg: makeRuntimeOrderConfig(m.deps, m.deps.DefaultAccount), BarMS: previous.BarMS, simulOpen: previous.SimulOpen, simulOpenSt: previous.Strategies}
-	limits := sharedEntryLimits{MaxOpen: gate.maxOpenOrders(), MaxSimul: gate.maxSimulOpen()}
-	if previous.AccountLimits != nil && *previous.AccountLimits != limits {
-		return false, errors.New("biz: shared account TS admission limits changed; explicit policy update required")
-	}
-	policyLimits := previous.PolicyLimits
-	if policyLimits == nil {
-		policyLimits = make(map[string]sharedEntryLimits)
-	}
-	declared := policies[req.StratName]
-	if declared == nil && m.deps.Strategies != nil {
-		if strategy := m.deps.Strategies.Get(exs.Symbol, req.StratName); strategy != nil {
-			declared = strategy.Policy
-		}
-	}
-	if saved, exists := policyLimits[req.StratName]; exists {
-		if declared != nil && saved != (sharedEntryLimits{MaxOpen: declared.MaxOpen, MaxSimul: declared.MaxSimulOpen}) {
-			return false, errors.New("biz: shared strategy TS admission limits changed; explicit policy update required")
-		}
-		policies[req.StratName] = &config.RunPolicyConfig{MaxOpen: saved.MaxOpen, MaxSimulOpen: saved.MaxSimul}
-	} else if declared != nil {
-		policyLimits[req.StratName] = sharedEntryLimits{MaxOpen: declared.MaxOpen, MaxSimul: declared.MaxSimulOpen}
-	}
-	if gate.simulOpenSt == nil {
-		gate.simulOpenSt = make(map[string]int)
-	}
-	barMS := m.deps.Clock.TimeMS()
-	if secs, err := utils.TFToSecSafe(tf); err == nil && secs > 0 {
-		if barMS >= 100000000000 {
-			barMS = utils.AlignTfMSecs(barMS, int64(secs)*1000)
-		} else {
-			barMS = barMS / (int64(secs) * 1000) * (int64(secs) * 1000)
-		}
-	}
-	// Short fixture clocks and irregular events still have a valid first round.
-	barMS = max(int64(1), barMS)
-	allowed, _ := gate.allowOrderEnterWithCounts(exs, tf, []*strat.EnterReq{req}, openNum, counts, policies, barMS)
-	if len(allowed) == 0 {
-		return false, nil
-	}
-	state.Admission = sharedEntryAdmission{BarMS: gate.BarMS, SimulOpen: gate.simulOpen, Strategies: gate.simulOpenSt, AccountLimits: &limits, PolicyLimits: policyLimits}
-	return true, nil
+	return admitTimeSeriesEntry(m.deps, jobPolicies, state, snapshot, exs, tf, req)
 }
 
 func (m *SharedOrderMgr) ExitOpenOrders(pairs string, req *strat.ExitReq) ([]*ormo.InOutOrder, *errs.Error) {
@@ -764,6 +715,22 @@ func (m *SharedOrderMgr) exitOpenOrders(pairs string, req *strat.ExitReq, timefr
 	}
 	if (req.OrderType != core.OrderTypeEmpty && req.OrderType != core.OrderTypeMarket && req.OrderType != core.OrderTypeLimit && req.OrderType != core.OrderTypeLimitMaker) || req.ExitRate > 1 || req.OrderID < 0 || (core.IsLimitOrder(req.OrderType) && req.Limit <= 0) || (req.Dirt != core.OdDirtBoth && req.Dirt != core.OdDirtLong && req.Dirt != core.OdDirtShort) || req.FilledOnly && req.UnFillOnly {
 		return nil, sharedBridgeError(errors.New("biz: invalid or unsupported shared exit request"))
+	}
+	if req.Limit > 0 {
+		orderSymbol := ""
+		if req.OrderID > 0 {
+			orders, lock := m.deps.Orders.GetOpenODs(m.deps.DefaultAccount)
+			lock.Lock()
+			if od := orders[req.OrderID]; od != nil {
+				orderSymbol = od.Symbol
+			}
+			lock.Unlock()
+		}
+		if tick, ok := exitTick(m.config.Instruments, pairs, orderSymbol); ok {
+			rounded := *req
+			rounded.Limit = roundToTick(req.Limit, tick)
+			req = &rounded
+		}
 	}
 	var ids []int64
 	err := m.mutate(func(s *SharedAccount, state *sharedTSCheckpoint, snapshot execution.AccountSnapshot, now, serial int64) error {
@@ -1565,9 +1532,6 @@ func (m *SharedOrderMgr) projectSnapshot(restore bool, orderID int64) error {
 		if err != nil {
 			return err
 		}
-		if err := m.restoreTakeovers(m.account.Context(), s.Store(), &state, snapshot); err != nil {
-			return err
-		}
 		cursor, err := s.Store().ProjectionCursor(context.Background(), name)
 		if err != nil {
 			return err
@@ -1971,12 +1935,18 @@ func (m *SharedOrderMgr) dispatchOrderEvent(od *ormo.InOutOrder, kind int, event
 	m.mu.Unlock()
 	dispatch := func() {
 		strat.FireOdChangeWithState(m.deps.Strategies, m.deps.DefaultAccount, od, kind)
-		if job != nil && job.Strat.OnOrderChange != nil {
-			job.Strat.OnOrderChange(job, od, kind)
+		if job != nil {
+			applyHedgeOff(job, od, kind)
+			if job.Strat.OnOrderChange != nil {
+				job.Strat.OnOrderChange(job, od, kind)
+			}
 		}
 	}
 	if job != nil {
 		job.WithOrderEvent(eventID, dispatch)
+		// Flush requests queued by the callback now; their command IDs derive
+		// from eventID, so replay before AdvanceProjection stays idempotent.
+		flushCallbackOrders(&m.deps, job, m.ProcessOrders)
 	} else {
 		dispatch()
 	}

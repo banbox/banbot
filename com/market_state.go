@@ -33,6 +33,13 @@ func (s *PairCopiedState) SetPairMsAt(nowMS int64, pair string, barMS, waitMS in
 	s.lock.Unlock()
 }
 
+// Touch records that the feed was alive at nowMS without reporting a bar.
+func (s *PairCopiedState) Touch(nowMS int64) {
+	if s != nil {
+		atomicMax(&s.lastCopiedMs, nowMS)
+	}
+}
+
 func atomicMax(dst *atomic.Int64, value int64) {
 	for {
 		current := dst.Load()

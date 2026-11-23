@@ -8,7 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"time"
 
+	"github.com/banbox/banexg/utils"
 	"github.com/shopspring/decimal"
 )
 
@@ -43,6 +45,9 @@ type PendingCreateSpec struct {
 	Protections   []PositionProtection
 	Feed          PendingFeedID
 	StopBars      int64
+	// OCOGroup optionally joins the entry to a One-Cancels-the-Other group of
+	// the same strategy and instrument (see pending_oco.go).
+	OCOGroup string `json:",omitempty"`
 }
 
 // PendingCommand is a strategy-scoped optimistic revision, not a replacement of
@@ -119,6 +124,32 @@ func validateCommandProtections(specs []PositionProtection) error {
 	return nil
 }
 
+// checkOrderPriceTick refuses an order price (a limit that can become a real
+// or venue order price) off the instrument tick at admission. Accepting it
+// would only fail later, in an autonomous plan the account owner cannot stop
+// retrying, and freeze the whole account. Trigger levels, stops and trailing
+// activation are thresholds compared with quotes, never sent as order prices,
+// so they are not required to sit on the tick.
+func checkOrderPriceTick(instrument Instrument, prices ...decimal.Decimal) error {
+	for _, price := range prices {
+		if !price.IsPositive() {
+			continue
+		}
+		if _, remainder := price.QuoRem(instrument.PriceTick, 0); !remainder.IsZero() {
+			return rejected(RejectLimitOffTick, "execution: order limit violates instrument tick")
+		}
+	}
+	return nil
+}
+
+func protectionLimits(specs []PositionProtection) []decimal.Decimal {
+	limits := make([]decimal.Decimal, 0, len(specs))
+	for _, spec := range specs {
+		limits = append(limits, spec.Limit)
+	}
+	return limits
+}
+
 func (c PendingCommand) validate() error {
 	if !canonicalID(c.ID) || len(c.ID) > 512 || !canonicalID(string(c.Strategy)) || !canonicalID(string(c.Lot)) || len(c.Lot) > 512 || c.ExpectedRevision < 0 || c.ExpectedRevision == math.MaxInt64 {
 		return errors.New("execution: invalid pending command identity or revision")
@@ -138,6 +169,9 @@ func (c PendingCommand) validate() error {
 		}
 		if c.Create.StopBars < 0 || c.Create.StopBars > 0 && !validPendingFeed(c.Create.Feed) || c.Create.StopBars == 0 && c.Create.Feed != "" || c.Create.Conditions.StopBars != 0 {
 			return errors.New("execution: command bar expiry requires an explicit feed")
+		}
+		if c.Create.OCOGroup != "" && !validOCOGroup(c.Create.OCOGroup) {
+			return errors.New("execution: invalid OCO group")
 		}
 		if err := c.Create.Policy.Validate(); err != nil {
 			return err
@@ -161,6 +195,22 @@ func (c PendingCommand) validate() error {
 		return errors.New("execution: unknown pending command action")
 	}
 	return nil
+}
+
+// staleEntryMinAge is the floor of the entry freshness window.
+const staleEntryMinAge = 2 * time.Minute
+
+// staleEntry reports whether the signal time of a time-series create is older
+// than max(2 x timeframe, 2 minutes) at owner time now. A ws or unparsable
+// timeframe uses the 2 minute floor.
+func staleEntry(m *TimeSeriesMetadata, now int64) bool {
+	window := staleEntryMinAge
+	if m.TimeFrame != "ws" {
+		if seconds, err := utils.TFToSecSafe(m.TimeFrame); err == nil && seconds > 0 {
+			window = max(window, 2*time.Duration(seconds)*time.Second)
+		}
+	}
+	return m.CreatedMS > 0 && now-m.CreatedMS > window.Milliseconds()
 }
 
 func (s *SharedAccount) applyPendingCommand(ctx context.Context, c PendingCommand, hash [32]byte, now int64) (int64, error) {
@@ -211,8 +261,23 @@ func (s *SharedAccount) applyPendingCommand(ctx context.Context, c PendingComman
 	if err != nil {
 		return 0, err
 	}
-	if !s.ready || !policy.StrategyGrossLimits[c.Strategy].IsPositive() {
+	if !policy.StrategyGrossLimits[c.Strategy].IsPositive() {
 		return 0, errors.New("execution: pending command requires a reconciled, declared strategy")
+	}
+	if !s.ready {
+		// A new entry is refused with a typed code so the robot drops it and
+		// keeps running; it left nothing behind. Exits, edits and protection
+		// changes stay hard errors (fail closed).
+		if c.Create != nil {
+			return 0, rejectedAt(RejectAccountNotReady, "execution: account is not reconciled; new entry refused", rejectionScope{Strategy: c.Strategy, Lot: c.Lot, Instrument: c.Create.Instrument, Kind: EntryIntent})
+		}
+		return 0, errors.New("execution: pending command requires a reconciled, declared strategy")
+	}
+	// A frozen create resent long after its signal (robot restart, outage) would
+	// fill at a price the strategy never chose. Checked after the receipt branch
+	// above so an already accepted command still replays idempotently.
+	if c.Create != nil && c.Metadata != nil && staleEntry(c.Metadata, now) {
+		return 0, rejectedAt(RejectStaleEntry, "execution: entry signal is stale; new entry refused", rejectionScope{Strategy: c.Strategy, Lot: c.Lot, Instrument: c.Create.Instrument, Kind: EntryIntent})
 	}
 	revisionName := "pending-revision:" + string(c.Lot)
 	body, err = s.store.StrategyCheckpoint(ctx, c.Strategy, revisionName)
@@ -238,6 +303,7 @@ func (s *SharedAccount) applyPendingCommand(ctx context.Context, c PendingComman
 		}
 	}
 	now = s.SendTime(now)
+	var extraCheckpoints []StrategyCheckpoint
 	if c.Metadata != nil {
 		entrySide := OrderSide("")
 		if c.Create != nil {
@@ -270,6 +336,9 @@ func (s *SharedAccount) applyPendingCommand(ctx context.Context, c PendingComman
 		if !ok {
 			return 0, errors.New("execution: pending instrument not registered")
 		}
+		if err := checkOrderPriceTick(market.instrument, append(protectionLimits(c.Create.Protections), c.Create.Conditions.Limit)...); err != nil {
+			return 0, err
+		}
 		snapshot, err := s.store.Snapshot(ctx)
 		if err != nil {
 			return 0, err
@@ -288,10 +357,18 @@ func (s *SharedAccount) applyPendingCommand(ctx context.Context, c PendingComman
 		} else if !errors.Is(err, sql.ErrNoRows) {
 			return 0, err
 		}
+		admission, err := s.admitTimeSeriesCreate(ctx, c, snapshot, definitions)
+		if err != nil {
+			return 0, err
+		}
+		extraCheckpoints = append(extraCheckpoints, admission...)
 		definition := PendingDefinition{Instrument: market.instrument.Clone(), Policy: c.Create.Policy, Specs: c.Create.Protections, Order: PendingOrder{Strategy: c.Strategy, Lot: c.Lot}}
 		definition.Order.Entry = EligibleIntent{ID: VirtualIntentID(fmt.Sprintf("pending-entry/%x", hash)), Account: s.AccountKey(), Strategy: c.Strategy, Lot: c.Lot, Instrument: c.Create.Instrument, Kind: EntryIntent, Side: c.Create.Side, QuantitySteps: c.Create.QuantitySteps, Conditions: c.Create.Conditions, State: PendingCondition}
 		if err := definition.Order.Entry.Validate(); err != nil {
 			return 0, err
+		}
+		if c.Create.OCOGroup != "" {
+			definition.Order.OCOGroup, definition.Order.OCOSeq = c.Create.OCOGroup, nextOCOSeq(definitions)
 		}
 		if c.Create.StopBars > 0 {
 			if err := s.BindPendingFeedExpiryAt(ctx, &definition.Order, c.Create.Feed, c.Create.StopBars, now); err != nil {
@@ -304,6 +381,14 @@ func (s *SharedAccount) applyPendingCommand(ctx context.Context, c PendingComman
 			return 0, errors.New("execution: pending command lot not found")
 		}
 		d := &definitions[index]
+		// Every order price is checked before cancellations or any other write.
+		prices := protectionLimits(c.Protections)
+		if c.Exit != nil {
+			prices = append(prices, c.Exit.Conditions.Limit)
+		}
+		if err := checkOrderPriceTick(d.Instrument, append(prices, c.Limit)...); err != nil {
+			return 0, err
+		}
 		if c.Action == PendingSetExit || c.Action == PendingEditExitLimit || c.Action == PendingCancelExit {
 			if err := s.applyPendingExit(ctx, d, c, hash, now); err != nil {
 				return 0, err
@@ -365,6 +450,7 @@ func (s *SharedAccount) applyPendingCommand(ctx context.Context, c PendingComman
 	version, _ := json.Marshal(revision)
 	checkpoints := []StrategyCheckpoint{{Strategy: c.Strategy, Name: receiptName, Payload: body}, {Strategy: c.Strategy, Name: revisionName, Payload: version}}
 	checkpoints = append(checkpoints, ordering...)
+	checkpoints = append(checkpoints, extraCheckpoints...)
 	if c.Metadata != nil {
 		metadataCopy := *c.Metadata
 		if exit := definitions[index].Order.Exit; exit != nil {

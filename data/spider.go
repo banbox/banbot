@@ -1113,6 +1113,11 @@ func RunLiveSpiderWithRuntimeDeps(ctx context.Context, addr string, deps *Runtim
 		spider.Stop()
 		spider.Join()
 	}()
+	// RunForever blocks in Accept and only returns once the listener is closed.
+	// Cancellation of the owning runtime (process shutdown) must therefore stop
+	// the spider itself; otherwise the process ignores SIGINT/SIGTERM.
+	stopOnCancel := context.AfterFunc(ctx, spider.Stop)
+	defer stopOnCancel()
 	return spider.RunForever(0, 0)
 }
 

@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/banbox/banexg/log"
 	"github.com/shopspring/decimal"
+	"go.uber.org/zap"
 	"time"
 )
 
@@ -153,6 +155,8 @@ func (b *SharedAccountBorrow) StartReportsContext(callerCtx context.Context) err
 			borrow := service.Borrow()
 			defer borrow.Release()
 			fail := func(id string, cause error, now int64) {
+				// The cause otherwise only reaches reportErrors, which nobody may read.
+				log.Error("account frozen by the private report worker", zap.String("reason", id), zap.Error(cause))
 				freezeErr := borrow.FreezeFailure(id, now)
 				select {
 				case service.reportErrors <- errors.Join(cause, freezeErr):
@@ -161,27 +165,88 @@ func (b *SharedAccountBorrow) StartReportsContext(callerCtx context.Context) err
 			}
 			ticker := time.NewTicker(5 * time.Second)
 			defer ticker.Stop()
+			var lastFundingMS, lastReconcileMS int64
+			var outage transientOutage
+			// recoverCash fetches funding settlements. It is not run on every tick:
+			// a reconciliation cash mismatch fetches on demand (settleAndReconcile),
+			// and fundingRecoveryInterval keeps the watermark advancing. Polling it
+			// every tick exceeded the venue's income rate limit within minutes.
+			recoverCash := func() error {
+				recovery, ok := service.opts.Adapter.(interface {
+					RecoverCash(context.Context, *SharedAccountBorrow) error
+				})
+				if !ok {
+					return nil
+				}
+				if err := recovery.RecoverCash(ctx, borrow); err != nil {
+					return err
+				}
+				lastFundingMS = time.Now().UnixMilli()
+				return nil
+			}
+			// settleAndReconcile returns (skipped, err). skipped means a transient
+			// venue read failed: the account stays unready until a later attempt
+			// succeeds, nothing is frozen and the worker keeps running.
+			settleAndReconcile := func(id string) (bool, error) {
+				if time.Now().UnixMilli()-lastFundingMS >= fundingRecoveryInterval.Milliseconds() {
+					if err := recoverCash(); err != nil {
+						if !transientAccountReadError(err) {
+							return false, err
+						}
+						// Back off instead of hitting a rate-limited endpoint every tick.
+						// Reconcile still decides: without a new settlement it succeeds.
+						lastFundingMS = time.Now().UnixMilli() - fundingRecoveryInterval.Milliseconds() + fundingRetryBackoff.Milliseconds()
+						outage.noteRateLimit(id+"-funding", err)
+						log.Warn("scheduled funding fetch failed transiently; retrying later", zap.String("stage", id), zap.Error(err))
+					}
+				}
+				now := time.Now().UnixMilli()
+				err := borrow.Reconcile(fmt.Sprintf("%s/%d", id, now), now)
+				if errors.Is(err, ErrReconciliationCashMismatch) {
+					// A settlement since the last fetch explains the difference.
+					// A genuine external change still mismatches after the fetch.
+					if ferr := recoverCash(); ferr != nil {
+						if outage.transient(id+"-funding", ferr) {
+							return true, nil
+						}
+						return false, ferr
+					}
+					now = time.Now().UnixMilli()
+					err = borrow.Reconcile(fmt.Sprintf("%s/%d", id, now), now)
+				}
+				if err != nil && outage.transient(id, err) {
+					return true, nil
+				}
+				return false, err
+			}
 			reconcile := func(reason string) bool {
 				if err := borrow.RefreshWorkingOrders(ctx, time.Now().UnixMilli()); err != nil {
+					if outage.transient(reason+"-recovery", err) {
+						return true
+					}
 					fail(reason+"-recovery", err, time.Now().UnixMilli())
 					return false
 				}
-				if recovery, ok := service.opts.Adapter.(interface {
-					RecoverCash(context.Context, *SharedAccountBorrow) error
-				}); ok {
-					if err := recovery.RecoverCash(ctx, borrow); err != nil {
-						fail(reason+"-funding", err, time.Now().UnixMilli())
-						return false
-					}
-				}
-				if err := borrow.Reconcile(fmt.Sprintf(reason+"-reconcile/%d", time.Now().UnixMilli()), time.Now().UnixMilli()); err != nil {
+				skipped, err := settleAndReconcile(reason + "-reconcile")
+				if err != nil {
 					fail(reason+"-reconcile", err, time.Now().UnixMilli())
 					return false
 				}
+				if skipped {
+					return true
+				}
+				lastReconcileMS = time.Now().UnixMilli()
+				outage.recovered()
 				if err := borrow.AdvancePendingExecution(ctx, time.Now().UnixMilli()); err != nil {
+					if outage.transient(reason+"-pending-execution", err) {
+						return true
+					}
 					fail(reason+"-pending-execution", err, time.Now().UnixMilli())
 					return false
 				}
+				// Keeps the loss-stop equity history current while no robot asks.
+				// It is advisory sampling: a failure must not freeze the account.
+				_, _ = borrow.LossStopStatus(ctx, time.Now().UnixMilli())
 				service.notifyCommitted()
 				return true
 			}
@@ -193,6 +258,31 @@ func (b *SharedAccountBorrow) StartReportsContext(callerCtx context.Context) err
 					service.joinReportSource(stream)
 					return
 				case <-ticker.C:
+					if outage.paused() {
+						continue
+					}
+					// A full venue snapshot costs request weight shared by every
+					// process on the host IP. The private stream wakes reconciliation
+					// on account changes; between periodic snapshots a reconciled
+					// account only advances pending execution on visible quotes.
+					if outage.sinceMS == 0 && time.Now().UnixMilli()-lastReconcileMS < privateReconcileInterval.Milliseconds() {
+						reconciled := false
+						err := borrow.WithState(func(s *SharedAccount) error {
+							if reconciled = s.Reconciled(); !reconciled {
+								return nil
+							}
+							return s.AdvancePendingExecution(ctx, time.Now().UnixMilli())
+						})
+						if reconciled && (err == nil || outage.transient("private-periodic-pending-execution", err)) {
+							continue
+						}
+						if reconciled {
+							fail("private-periodic-pending-execution", err, time.Now().UnixMilli())
+							cancel()
+							service.joinReportSource(stream)
+							return
+						}
+					}
 					if !reconcile("private-periodic") {
 						cancel()
 						service.joinReportSource(stream)
@@ -211,10 +301,15 @@ func (b *SharedAccountBorrow) StartReportsContext(callerCtx context.Context) err
 							fail("private-external/"+report.UnassignedExchangeID, err, now)
 						} else if err := borrow.Reconcile(fmt.Sprintf("private-external-reconcile/%s/%d", report.UnassignedExchangeID, now), now); err != nil {
 							fail("private-external-reconcile/"+report.UnassignedExchangeID, err, now)
-						} else if err := borrow.AdvancePendingExecution(ctx, time.Now().UnixMilli()); err != nil {
+						} else if err := borrow.AdvancePendingExecution(ctx, time.Now().UnixMilli()); err != nil && !outage.transient("private-external-pending/"+report.UnassignedExchangeID, err) {
 							fail("private-external-pending/"+report.UnassignedExchangeID, err, time.Now().UnixMilli())
 						}
 					} else if report.AccountChanged && report.Err == nil && report.UnassignedExchangeID == "" && report.OrderID == "" {
+						// A wake-up only: the first periodic tick after a rate-limit
+						// pause reconciles the same change.
+						if outage.paused() {
+							continue
+						}
 						if !reconcile("private-account") {
 							cancel()
 							service.joinReportSource(stream)
@@ -226,18 +321,18 @@ func (b *SharedAccountBorrow) StartReportsContext(callerCtx context.Context) err
 						if err := borrow.Recover(report.OrderID); err != nil {
 							fail("private-recovery/"+report.OrderID, err, now)
 						} else {
-							if recovery, ok := service.opts.Adapter.(interface {
-								RecoverCash(context.Context, *SharedAccountBorrow) error
-							}); ok {
-								if err := recovery.RecoverCash(ctx, borrow); err != nil {
-									fail("private-funding/"+report.OrderID, err, now)
-									continue
-								}
-							}
-							if err := borrow.Reconcile(fmt.Sprintf("private-reconcile/%s/%d", report.OrderID, now), now); err != nil {
+							// A transient read failure leaves the account unready; the
+							// next periodic tick reconciles again.
+							// The recovered fill is committed either way: listeners are
+							// notified below even when reconciliation was skipped.
+							if skipped, err := settleAndReconcile("private-reconcile/" + report.OrderID); err != nil {
 								fail("private-reconcile-error/"+report.OrderID, err, now)
-							} else if err := borrow.AdvancePendingExecution(ctx, time.Now().UnixMilli()); err != nil {
-								fail("private-pending-execution/"+report.OrderID, err, time.Now().UnixMilli())
+							} else if !skipped {
+								lastReconcileMS = time.Now().UnixMilli()
+								outage.recovered()
+								if err := borrow.AdvancePendingExecution(ctx, time.Now().UnixMilli()); err != nil && !outage.transient("private-pending-execution/"+report.OrderID, err) {
+									fail("private-pending-execution/"+report.OrderID, err, time.Now().UnixMilli())
+								}
 							}
 						}
 					}

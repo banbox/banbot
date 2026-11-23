@@ -172,6 +172,9 @@ func initializeExplicitExchange(exchange banexg.BanExchange, snapshot *config.Sn
 		if err.Code == errs.CodeCredsRequired {
 			// Backtests and data commands normally run without API keys; the default brackets are expected there.
 			logger.Debug("no API credentials, use default leverage brackets for maint margin", zap.String("err", err.Short()))
+		} else if account == "" && err.Code == errs.CodeAccKeyError {
+			// A Hub holds no account credentials (they arrive with robot registration).
+			logger.Info("no account configured on this process, use default leverage brackets for maint margin", zap.String("err", err.Short()))
 		} else {
 			logger.Error("LoadLeverageBrackets fail, maint margin calculation may have large deviation", zap.String("err", err.Short()))
 		}
@@ -533,6 +536,9 @@ func runExplicitTradeContext(ctx context.Context, args *config.CmdArgs, startup 
 }
 
 func runExplicitTradeSpecContext(ctx context.Context, args *config.CmdArgs, spec *config.RunSpec, startup live.CryptoTraderStartupFunc) *errs.Error {
+	if err := rejectUnsupportedLiveEnv(spec); err != nil {
+		return err
+	}
 	if slices.Contains(spec.Engines(), config.EngineFactor) {
 		configs, buildErr := buildFactorConfigs(spec, runner.Trade)
 		if buildErr != nil {
@@ -552,54 +558,43 @@ func runExplicitTradeSpecContext(ctx context.Context, args *config.CmdArgs, spec
 	if spec.Config().Root.Env == core.RunEnvProd || spec.Config().Root.Env == core.RunEnvDryRun {
 		return errs.NewMsg(core.ErrBadConfig, "time-series execution: prod/dry_run requires explicit execution ledger, risk, funding and protection declarations; the legacy live sender is disabled")
 	}
+	// Only an unset env reaches here (normalized configs default to dry_run).
+	// Keep the history check first so a cold-history declaration is still
+	// reported before the refusal.
 	if err := validateLegacyHistory(spec); err != nil {
 		return errs.New(core.ErrBadConfig, err)
 	}
-	session, snapshot, err := openExplicitEntrySessionFromSpecContext(ctx, args, spec, "trade")
-	if err != nil {
-		return err
+	return errs.NewMsg(core.ErrBadConfig, "%s", unsupportedLiveEnvMessage(spec.Config().Root.Env))
+}
+
+// errUnsupportedTestnet is the refusal for env: test in live trading: the
+// legacy order stack that served testnet was removed and the execution path
+// only accepts prod and dry_run.
+const errUnsupportedTestnet = "testnet live trading is not supported by the execution path; use env: dry_run or prod"
+
+func unsupportedLiveEnvMessage(env string) string {
+	if env == core.RunEnvTest {
+		return errUnsupportedTestnet
 	}
-	defer session.close()
-	startAt := btime.UTCStamp()
-	rt, err := session.newRuntime(snapshot, core.RunModeLive, startAt)
-	if err != nil {
-		return err
+	return fmt.Sprintf("live trading env %q is not supported by the execution path; use env: dry_run or prod", env)
+}
+
+// rejectUnsupportedLiveEnv refuses, at startup, the live configurations that
+// only the removed legacy order stack served: env outside prod/dry_run
+// (testnet) and non-linear markets (spot, margin, inverse).
+func rejectUnsupportedLiveEnv(spec *config.RunSpec) *errs.Error {
+	if spec == nil || spec.Config() == nil {
+		return nil
 	}
-	defer func() {
-		rt.Close()
-		rt.Join()
-	}()
-	logger, logErr := session.configureRuntimeLogger(rt.Notifications)
-	if logErr != nil {
-		return logErr
+	root := spec.Config().Root
+	if env := root.Env; env != "" && env != core.RunEnvProd && env != core.RunEnvDryRun {
+		return errs.NewMsg(core.ErrBadConfig, "%s", unsupportedLiveEnvMessage(env))
 	}
-	rt.Core.Logger = logger
-	if args.OutPath != "" {
-		dumpPath := snapshot.ParsePath(args.OutPath)
-		file, fileErr := os.OpenFile(dumpPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if fileErr != nil {
-			logger.Error("open live dump file fail", zap.Error(fileErr))
-		} else {
-			rt.Dump = orm.NewDumpSink(file, rt.Clock.TimeMS)
-			// banexg's websocket replay stream has a different gob format from
-			// the application dump, so keep it in a sibling file instead of
-			// letting two encoders append to the same path.
-			if dumpErr := session.exchange.SetDump(dumpPath + ".ws"); dumpErr != nil {
-				_ = rt.Dump.Close()
-				rt.Dump = nil
-				_ = file.Close()
-				return dumpErr
-			}
-		}
+	switch root.MarketType {
+	case banexg.MarketSpot, banexg.MarketMargin, banexg.MarketInverse:
+		return errs.NewMsg(core.ErrBadConfig, "market_type %q is not supported by the execution path (linear USDT-margined perpetuals only): spot, margin and inverse/dated contracts are refused", root.MarketType)
 	}
-	t, err := live.NewCryptoTraderWithRuntimeDeps(rt.BizDeps(), startup)
-	if err != nil {
-		return err
-	}
-	if profileErr := session.startProfiles(); profileErr != nil {
-		return profileErr
-	}
-	return t.Run()
+	return nil
 }
 
 func runExplicitDownData(args *config.CmdArgs) *errs.Error {

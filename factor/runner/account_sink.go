@@ -255,7 +255,9 @@ func (s *AccountSink) ProcessSnapshot(ctx context.Context, p *factor.TargetPortf
 			if s.Clock == nil {
 				return errors.New("runner: live quote fetch requires a real completion clock")
 			}
-			visible, err = s.VisibleQuote(ctx, i.ID, now)
+			// A reused account quote is refetched unless observed at or after
+			// the target's executable time (execution.ReuseRecentQuotes).
+			visible, err = s.VisibleQuote(execution.WithQuoteNotBefore(ctx, sp.ExecutableAt), i.ID, now)
 			if err != nil {
 				return err
 			}

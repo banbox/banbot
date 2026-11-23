@@ -274,14 +274,3 @@ func migrateOrderAttempts(tx *sql.Tx) error {
 	_, err = tx.Exec("DROP TABLE exec_attempt")
 	return err
 }
-
-func ensureMigrationSchema(tx *storeTxn) error {
-	if tx.memory != nil {
-		previous := tx.memory.migrationEnabled
-		tx.undo = append(tx.undo, func() { tx.memory.migrationEnabled = previous })
-		tx.memory.migrationEnabled = true
-		return nil
-	}
-	_, err := tx.sql.ExecContext(tx.ctx, migrationSchema)
-	return err
-}

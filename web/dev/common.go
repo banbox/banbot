@@ -623,8 +623,11 @@ func collectSeparateBtTask(rootDir, relPath string) (*ormu.Task, error) {
 		Configs:   []string{configPath},
 		NoDefault: true,
 	}, false)
-	if cfgErr != nil || cfg == nil || len(cfg.RunPolicy) <= 1 {
+	if cfgErr != nil {
 		return nil, cfgErr
+	}
+	if cfg == nil || len(cfg.RunPolicy) <= 1 {
+		return nil, nil
 	}
 
 	// Require the expected contiguous policy directories. This avoids

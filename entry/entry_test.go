@@ -253,7 +253,7 @@ func TestBacktestAndLiveRunnersUseIsolatedRuntimeDeps(t *testing.T) {
 		t.Fatal(backtestErr)
 	}
 	liveRunnerDeps := liveRuntime.BizDeps()
-	liveTrader, traderErr := live.NewCryptoTraderWithRuntimeDeps(liveRunnerDeps, nil)
+	liveTrader, traderErr := live.NewCryptoTraderWithRuntimeDeps(liveRunnerDeps)
 	if traderErr != nil {
 		t.Fatal(traderErr)
 	}

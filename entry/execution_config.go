@@ -18,6 +18,9 @@ func accountExecutionFields(u *config.UnifiedConfig, account string) map[string]
 }
 
 // Both engine entry points resolve account overrides and path provenance here.
+// The removed execution.ts_facade key is rejected at config load
+// (config.validateAdvanced); the embedded production time-series robot always
+// uses the Hub order manager.
 func applyAccountExecutionConfig(spec *config.RunSpec, account string, settingsConfig *runner.ExecutionConfig) error {
 	u := spec.Config()
 	fields := accountExecutionFields(u, account)

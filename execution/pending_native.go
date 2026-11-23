@@ -289,6 +289,12 @@ func (s *SharedAccount) addNativeReservations(ctx context.Context, definitions [
 				reason = "native_trailing_state_recovery_unproven"
 			}
 			condition := ConditionalOrder{Kind: kind, TriggerPrice: o.ProtectionLevels[key], Limit: trigger.Conditions.Limit, Reference: MidpointTrigger}
+			if reason == "" && checkOrderPriceTick(d.Instrument, condition.TriggerPrice, condition.Limit) != nil {
+				// A venue trigger/limit must sit on the tick, or preparing the plan
+				// would be refused on every tick and freeze the account. Local
+				// protection compares quotes with the level and needs no tick.
+				reason = "conditional_price_off_tick"
+			}
 			if reason == "" {
 				var err error
 				condition.SourceHash, err = ConditionalSourceHash(*d, kind)

@@ -257,6 +257,11 @@ func (s *SharedAccount) applyTimeSeriesExit(ctx context.Context, c TimeSeriesExi
 			return nil, err
 		}
 	}
+	for _, match := range matches {
+		if err := checkOrderPriceTick(definitions[match.index].Instrument, c.Conditions.Limit); err != nil {
+			return nil, err
+		}
+	}
 	preferFilled := c.FilledOnly
 	if c.Conditions.Limit.IsPositive() && len(matches) > 0 {
 		first := definitions[matches[0].index]

@@ -72,7 +72,10 @@ func (a *BanexgAdapter) DefaultLimitPrice(ctx context.Context, id string, side O
 		return 0, err
 	}
 	received := time.Now().UnixMilli()
-	if book == nil || book.Symbol != entry.Symbol || book.TimeStamp <= 0 || book.TimeStamp > received || received-book.TimeStamp >= a.config.QuoteTTL.Milliseconds() {
+	if book == nil || book.Symbol != entry.Symbol {
+		return 0, errors.New("execution: missing or stale banexg limit-price book")
+	}
+	if _, fresh := observedBookMS(book.TimeStamp, received, a.config.QuoteTTL); !fresh {
 		return 0, errors.New("execution: missing or stale banexg limit-price book")
 	}
 	bids, err := normalizeLimitPriceSide(book.Bids)

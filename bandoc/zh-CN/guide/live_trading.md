@@ -66,7 +66,7 @@ export BanDataDir=/ban/data
 
 交易所网络代理读取 `exchange.<name>.proxy`：写 `no` 表示不使用代理；留空时启动阶段自动探测一次环境变量/系统代理，之后各交易所共用该结果，探测后修改系统代理需重启才生效。详见[网络代理](./configuration.md#网络代理)。
 
-实时模拟选 `env: dry_run` 并声明 `execution.funding_policy: explicit-zero`；生产选 `env: prod`、真实账户凭据与 `required-stream`。两者都需执行单位、资本与风险声明。纯时序还要求 `execution.store` 和 `sender_lease_dir`；旧配置的 `fatal_stop`、动态 `leverage`（含账户级）尚不能用于共享实盘入口，会被拒绝。不要把旧配置直接改成 prod。详见[配置文件](./configuration.md)及[共享账户配置步骤](./execution.md#配置与启动)。
+实时模拟选 `env: dry_run` 并声明 `execution.funding_policy: explicit-zero`；生产选 `env: prod`、真实账户凭据与 `required-stream`。两者都需执行单位、资本与风险声明。纯时序还要求 `execution.store` 和 `sender_lease_dir`；`leverage`（含账户级）作为账户全部品种的固定杠杆由 Hub 账户 owner 设置到交易所，策略请求里的逐单杠杆仍被拒绝；`fatal_stop` 由账户 owner 按权益回落执行。不要把旧配置直接改成 prod。详见[配置文件](./configuration.md)及[共享账户配置步骤](./execution.md#配置与启动)。
 
 同一物理账户可由多个策略/机器人共享一个 Hub，保留各策略预算与持仓归属；不要让独立发送进程争用同一账户。独立资金边界使用不同子账户。多个机器人使用稳定、互不冲突的策略 ID，启动后核实归属和预算。
 
@@ -86,21 +86,43 @@ nohup /ban/bot trade --datadir /ban/data --config /ban/live.yml > /ban/data/trad
 
 停止单个机器人不会自动平仓，Hub 继续处理账户已有挂单和保护。Hub 重启后等待机器人重新认证，认证前本地保护未激活；保留执行目录和 journal，按[恢复步骤](./execution.md#重启与恢复)操作。不能把进程存在当作账户已恢复。
 
+内嵌生产时序机器人（自定义 `execution.live_provider`）无需单独的 Hub 进程，恒使用进程内 Hub 订单管理器（`execution.ts_facade` 已移除，配置它会报错）；同账户混合因子+时序机器人的时序部分也使用它（`SharedOrderMgr` 仅用于回测）。从旧门面升级的账户（含混合账户）在首次启动时自动一次性导入旧检查点，旧数据保持不动，不能再回滚到旧门面。详见[执行](./execution.md)。
+
 ## 订单类型的实盘行为
 
 Stop-Limit 入场、OCO 组、多级止盈和追踪止损在回测与实盘（含实时模拟）均可用，字段见[自定义策略](./strat_custom.md)，回测撮合方式见[回测指南](./backtest.md#撮合语义)。实盘需注意：
 
-- 止损、止盈和追踪止损在订单**完全入场后**才挂载；部分成交期间不挂。
-- `ExgStopLoss` / `ExgTakeProfit` 为 `false` 时不预挂交易所条件单，由本地价格监控触发；程序停止或行情不可用期间不提供保护。
-- 追踪止损优先使用交易所原生追踪单，回撤百分比超出交易所上限或被拒绝时，会降级为本地价格监控而不是让订单失败。
-- OCO 组内某挂单入场成交后，同组其余未成交挂单被撤销，出场标签 `oco_cancel`。
+- 止损、止盈和追踪止损由 `execution.protection_mode` 决定：`software`（默认）由 execution 引擎按价格监控触发，`native_preferred` 在适配器支持时优先挂交易所条件单，不支持时回退为引擎监控；追踪止损目前仍由引擎监控。程序停止期间 Hub 继续处理账户已有保护，Hub 不可用时本地保护不生效。
+- OCO 组内某挂单入场成交后，同组其余未成交挂单被撤销，出场标签 `oco_cancel`；默认 Hub 路径上，同一 tick 内同时可执行的成员只保留创建最早的一个（详见[自定义策略](./strat_custom.md)）。
 - 多级止盈在某级成交后才挂下一级；`MoveSLToBreakeven` 在该级成交后移动剩余仓位止损。
 - 回测专用的 `data_gap` / `delist` 强平标签与 `bt_*` 成本键在实盘不生效。
+
+## 实盘能力支持矩阵
+
+实盘与实时模拟一律经 execution 模块（Hub 或内嵌账户）。旧的实盘订单栈已删除，只在旧栈中存在的能力按下表处理：**支持**；**拒绝**（启动或请求时报错）；**忽略**（配置键被忽略，启动时告警，不阻止启动）。每项的迁移说明见仓库 `doc/project/05_biz_orders_live.md`「支持矩阵」。
+
+| 能力 | 状态 | 当前行为 |
+|---|---|---|
+| 对冲（双向）持仓模式 | 拒绝 | Hub 账户注册体检报错；持仓需为单向模式 |
+| 现货 / 保证金现货（`market_type: spot`/`margin`） | 拒绝 | 启动报 `market_type "spot" is not supported by the execution path (linear USDT-margined perpetuals only)…`；只支持 linear 永续 |
+| 反向合约、交割合约 | 拒绝 | 启动或适配器拒绝 |
+| 测试网（`env: test`） | 拒绝 | 启动报 `testnet live trading is not supported by the execution path; use env: dry_run or prod` |
+| 单笔订单杠杆、分档杠杆自动缩量 | 拒绝 | 杠杆只能按账户声明，由 Hub 账户 owner 设置；逐单杠杆被拒绝，超出交易所档位的下单由交易所拒绝 |
+| 动态 `UpdatePairs`、选币轮动（`pairlists`、`pairmgr.cron`） | 拒绝 / 忽略 | 品种在启动时固定；`UpdatePairs` 返回错误，选币键告警后忽略 |
+| 追加保证金 `margin_add_rate`、`charge_on_bomb` | 忽略 | 告警；风险由 owner 的准入与亏损熔断承担 |
+| 限价摆放 `put_limit_secs`、`odbook_ttl` | 忽略 | 告警；限价由 `order_mode`、`limit_vol_secs`、`near_limit_bps` 决定 |
+| 账户轮询 `account_pull_secs` | 忽略 | 告警；余额与权益来自账户 owner |
+| 实盘回测对比 `bt_in_live` | 忽略 | 告警；该功能已删除 |
+| 钱包快照落库 | 拒绝（不写入） | 不再写入 `wallet_snapshot` |
+| 止损/止盈/追踪止损、多级止盈、OCO、改单 | 支持 | 见上节；`execution.protection_mode` 选择引擎监控或优先原生条件单 |
+| `fatal_stop` | 支持（语义变化） | 由账户 owner 按权益回落执行并持久化暂停 |
+| `take_over_strat` | 支持（部分） | 外部接管记录恢复为策略订单；不再自动把交易所用户持仓生成跟踪单 |
+| `close_on_stuck` | 支持 | 超时未收到 K 线时经账户订单管理器平仓（只覆盖该 runtime 已注册管理器的账户） |
 
 ## 4. 消息通知、DashBoard和监控
 ### 消息通知与远程控制
 
-通过 `rpc_channels` 配置企业微信、邮件或 Telegram，消息模板、筛选和 SMTP 示例集中见[消息通知](./notifications.md)。`min_intv_secs` 与 `retry_delay` 的单位均为秒。通知异步排队，收到消息不代表刚刚成交，部署时仍需检查账户和日志。
+通过 `rpc_channels` 配置企业微信、邮件或 Telegram，消息模板、筛选和 SMTP 示例集中见[消息通知](./notifications.md)。`min_intv_secs` 与 `retry_delay` 的单位均为秒。共享账户机器人有多个账户时，Telegram 只在第一个可交易账户上运行（见[消息通知](./notifications.md)）。通知异步排队，收到消息不代表刚刚成交，部署时仍需检查账户和日志。
 
 Telegram 自建模式配置 `token` 与 `chat_id`；未配置 token 的仪表盘中转模式可从启动日志中的绑定链接接入，`secret` 留空会生成，手动设置须为 UUID v4。中转模式需放通 `www.banbot.site` 的 HTTPS 和 TCP 6788；自建模式需可访问 Telegram API，可配置渠道 `proxy`。
 
@@ -121,7 +143,7 @@ api_server:
       acc_roles: 
         user1: admin  # user1对应accounts中的用户key
 ```
-`api_server` 由时序 CryptoTrader 的启动路径托管；不要假设纯因子 Hub 运行会自动创建同样的 Dashboard。`/api/bot` 使用 JWT，账户操作还需角色授权；`/api/kline`、`/api/kline/csv/upload`、`/api/ws` 不在 JWT 鉴权组内，公网部署必须在反向代理处保护这些路径。
+共享账户实盘中，时序、因子、混合机器人只在恰有一个账户时启动 `api_server`（多个账户时不启动并记录告警）；请求须带 `X-Authorization: Bearer <token>` 和 `X-Account`，详见[共享账户与 Hub](./execution.md#运行与排障)。`/api/bot` 使用 JWT，账户操作还需角色授权；`/api/kline`、`/api/kline/csv/upload`、`/api/ws` 不在 JWT 鉴权组内，公网部署必须在反向代理处保护这些路径。
 
 上面的web服务是以http启动的，建议您将`bind_ip`设为服务器本地或内网ip，以避免未授权的访问。
 
@@ -138,19 +160,6 @@ ssh -L 8001:127.0.0.1:8001 your_username@remote_server_address
 ![image](/img/dash_login_cn.png)
 > 本地启动实盘，或ssh端口转发后，机器人的访问url都是127.0.0.1:[port]，其中port是`api_server.port`的值。  
 > 如果您通过nginx反向代理，这两个地址应当是从nginx访问的地址，比如"https://bot.myserver.com/8001"
-
-### 实盘回测对比
-banbot支持在实盘运行期间定时执行同样配置的回测，将回测订单记录逐个与实盘未平仓订单和交易所持仓进行对比，检查实盘是否有订单漏开、错开等情况：
-
-```yaml
-# 实盘回测配置
-bt_in_live:
-  cron: "0 0 * * *"  # 回测频率，corn表达式，每天0点执行
-  account: "account1"
-  mail_to: ["trader@company.com"]  # 对比结果将发送到配置的邮箱
-mail:  # 您还需要设置邮件发送方，具体可参考上面邮件通知
-  enable: true
-```
 
 ### 监控存活
 `check_bot.sh` 只按命令行中的配置文件名判断进程存在；下面的 `live` 对应 `live.yml`，不是 `trade` 子命令。还应监控 Hub 的恢复告警、账户冻结和行情可用性；进程存活不能证明保护有效。

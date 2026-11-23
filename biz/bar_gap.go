@@ -5,6 +5,7 @@ import (
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/core"
+	"github.com/banbox/banbot/execution"
 	"github.com/banbox/banbot/orm/ormo"
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banexg/errs"
@@ -20,7 +21,7 @@ const ExitTagDataGap = "data_gap"
 // ended long before (delisted / data ends): closed at the last bar's close, slippage included.
 const ExitTagDelist = "delist"
 
-const defaultGapMinHours = 48.0
+const defaultGapMinHours = execution.DefaultGapMinHours
 
 // barGapExceeded reports whether the distance between the end of the previous bar (prevStopMS) and the start of
 // the new bar (curStartMS) is a data hole: more than gapBars periods AND more than minHours hours.
@@ -194,14 +195,7 @@ func (t *Trader) sweepDelistedAll(timeMS int64) *errs.Error {
 // gapConfirmDelayMS is how long after its last bar a symbol must stay silent before the hole is a data gap /
 // delisting (the same rule as barGapExceeded): the time at which the backtest can first know about it.
 func gapConfirmDelayMS(tfMS int64, gapBars int, minHours float64) int64 {
-	if minHours <= 0 {
-		minHours = defaultGapMinHours
-	}
-	d := int64(gapBars) * tfMS
-	if m := int64(minHours * 3600 * 1000); m > d {
-		d = m
-	}
-	return d + 1
+	return execution.GapConfirmDelayMS(tfMS, gapBars, minHours)
 }
 
 func (o *LocalOrderMgr) delistPenalty() float64 {
@@ -220,19 +214,9 @@ func (o *LocalOrderMgr) delistPenalty() float64 {
 func (o *LocalOrderMgr) applyExitPolicy(od *ormo.InOutOrder, req *strat.ExitReq, last float64) float64 {
 	switch req.Tag {
 	case ExitTagDataGap:
-		if req.GapNextOpen > 0 {
-			if od.Short {
-				return max(last, req.GapNextOpen)
-			}
-			return min(last, req.GapNextOpen)
-		}
+		return execution.GapExitPrice(od.Short, last, req.GapNextOpen)
 	case ExitTagDelist:
-		if bps := o.delistPenalty(); bps > 0 {
-			if od.Short {
-				return last * (1 + bps/10000)
-			}
-			return last * (1 - bps/10000)
-		}
+		return execution.DelistExitPrice(od.Short, last, o.delistPenalty())
 	}
 	return last
 }
@@ -245,15 +229,5 @@ func (o *LocalOrderMgr) gapFillTime(od *ormo.InOutOrder, last, nowMS int64, req 
 		gapBars, minHours = o.runtimeCfg.gapBars, o.runtimeCfg.gapMinHours
 	}
 	tfMS := int64(utils.TFToSecs(od.Timeframe)) * 1000
-	at := last + gapConfirmDelayMS(tfMS, gapBars, minHours)
-	if req.GapRecoverMS > 0 && req.GapRecoverMS < at {
-		at = req.GapRecoverMS
-	}
-	if at > nowMS {
-		at = nowMS
-	}
-	if at < last {
-		at = last
-	}
-	return at
+	return execution.GapFillTime(last, nowMS, req.GapRecoverMS, gapConfirmDelayMS(tfMS, gapBars, minHours))
 }

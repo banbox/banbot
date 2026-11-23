@@ -29,9 +29,6 @@ func buildTimeSeriesLiveConfigs(spec *config.RunSpec) (map[string]runner.Config,
 	if (u.Root.Env != core.RunEnvProd && u.Root.Env != core.RunEnvDryRun) || u.Root.MarketType != "linear" || len(u.Root.StakeCurrency) != 1 {
 		return nil, errors.New("time-series execution: Hub execution requires a prod or dry_run linear account and one settlement currency")
 	}
-	if len(u.Root.FatalStop) > 0 || u.Root.Leverage > 0 {
-		return nil, errors.New("time-series execution: legacy fatal_stop and dynamic leverage need ledger-native migration before shared live execution")
-	}
 	currency := u.Root.StakeCurrency[0]
 	nav := u.Root.WalletAmounts[currency]
 	if nav <= 0 || math.IsNaN(nav) || math.IsInf(nav, 0) {
@@ -47,9 +44,6 @@ func buildTimeSeriesLiveConfigs(spec *config.RunSpec) (map[string]runner.Config,
 			return nil, err
 		}
 		for _, account := range accounts {
-			if configured := u.Root.Accounts[account]; configured != nil && configured.Leverage > 0 {
-				return nil, fmt.Errorf("time-series execution: account %s dynamic leverage is not supported", account)
-			}
 			if _, exists := result[account]; exists {
 				continue
 			}
@@ -103,6 +97,9 @@ func buildTimeSeriesLiveConfigs(spec *config.RunSpec) (map[string]runner.Config,
 }
 
 func runTimeSeriesExecution(ctx context.Context, args *config.CmdArgs, spec *config.RunSpec, startup live.CryptoTraderStartupFunc) (result error) {
+	if err := rejectExecutionDump(args); err != nil {
+		return err
+	}
 	configs, err := buildTimeSeriesLiveConfigs(spec)
 	if err != nil {
 		return err
@@ -130,6 +127,9 @@ func runTimeSeriesExecution(ctx context.Context, args *config.CmdArgs, spec *con
 	defer func() { result = errors.Join(result, closeFactorLiveSession(session, bindings)) }()
 	if err := session.ensureExchange(snapshot, core.RunModeLive); err != nil {
 		return err
+	}
+	if profileErr := session.startProfiles(); profileErr != nil {
+		return profileErr
 	}
 	// Prepare all accounts before any strategy receives live observations.
 	for _, account := range accounts {
@@ -179,13 +179,20 @@ func (s *explicitEntrySession) runTimeSeriesExecutionAccount(ctx context.Context
 			return fmt.Errorf("time-series execution: bridge instrument %s lacks matching account SDK units", symbol)
 		}
 	}
+	if leverage, levErr := declaredAccountLeverage(snapshot.View(), c.AccountID); levErr != nil || leverage > 0 {
+		return errors.Join(errors.New("time-series execution: declared leverage is applied by the Hub account owner; embedded execution providers do not support it"), levErr)
+	}
 	adapter, err := execution.NewBanexgAdapter(ctx, s.exchange, execution.BanexgAdapterConfig{Account: binding.Account, Instruments: units, Transport: binding.Transport, Absence: binding.Absence})
 	if err != nil {
 		return err
 	}
 	bridge := *binding.Legacy.Bridge
+	// One shared reuse window for the bridge and the account's pending
+	// execution: time-series consumers need a valid quote, not a fresh REST
+	// book per read (see execution.EmbeddedQuoteReuse).
+	observe := execution.ReuseRecentQuotes(adapter.Observe, execution.EmbeddedQuoteReuse)
 	bridge.QuoteContext = func(ctx context.Context, id string, _ int64) (execution.VisibleQuote, error) {
-		return adapter.Observe(ctx, id)
+		return observe(ctx, id)
 	}
 	bridge.OrderPolicy = execution.OrderPolicy{Mode: c.Execution.OrderMode, NearLimitBPS: c.Execution.NearLimitBPS, ProtectionMode: c.Execution.ProtectionMode}
 	bridge.DefaultLimitPrice = adapter.DefaultLimitPrice
@@ -208,6 +215,7 @@ func (s *explicitEntrySession) runTimeSeriesExecutionAccount(ctx context.Context
 		}
 	}
 	cfg := mixedLiveAccountConfig(snapshot.View(), c.AccountID, mixedLivePolicies(s.runSpec, c.AccountID))
+	cfg.APIServer = accountDashboardConfig(snapshot.View(), c.AccountID)
 	sourceOptions, err := factorSourcePlanOptions(s.runSpec.Config().Data)
 	if err != nil {
 		return err
@@ -217,11 +225,42 @@ func (s *explicitEntrySession) runTimeSeriesExecutionAccount(ctx context.Context
 	if err != nil {
 		return err
 	}
-	rt, err := s.process.NewRuntime(runtimepkg.Options{Context: ctx, Logger: s.logger, Config: cfg, DataDir: snapshot.DataDir, StrategyDir: snapshot.StrategyDir, Mode: core.RunModeLive, Env: cfg.Env, Exchange: s.exchange, Storage: s.storage, ExchangeName: cfg.Exchange.Name, Market: cfg.MarketType, ContractType: cfg.ContractType, Pairs: cfg.Pairs, Catalog: catalog, AccountOwnerKey: &binding.Account, SharedExecution: &options, SharedOrderBridge: &bridge, SharedMarketData: true, SourcePlanOptions: sourceOptions, NetDisable: s.netDisable, DisplayLocation: snapshot.Location()})
+	runtimeOptions := runtimepkg.Options{Context: ctx, Logger: s.logger, Config: cfg, DataDir: snapshot.DataDir, StrategyDir: snapshot.StrategyDir, Mode: core.RunModeLive, Env: cfg.Env, Exchange: s.exchange, Storage: s.storage, ExchangeName: cfg.Exchange.Name, Market: cfg.MarketType, ContractType: cfg.ContractType, Pairs: cfg.Pairs, Catalog: catalog, AccountOwnerKey: &binding.Account, SharedExecution: &options, SharedMarketData: true, SourcePlanOptions: sourceOptions, NetDisable: s.netDisable, DisplayLocation: snapshot.Location()}
+	// The order facade is always biz.HubOrderMgr over an in-process Hub port.
+	// The runtime borrows the account (via BorrowAccount below) and neither it
+	// nor the Hub ever closes it twice.
+	borrow, err := s.process.BorrowAccount(binding.Account, options)
+	if err != nil {
+		return err
+	}
+	defer borrow.Release()
+	embedded, err := execution.NewEmbeddedHub(ctx, borrow.Service(), time.Second)
+	if err != nil {
+		return err
+	}
+	// Registered before the runtime: runs after rt.Close, once the
+	// HubOrderMgr no longer polls the port.
+	defer func() { result = errors.Join(result, embedded.Close()) }()
+	hubBridge, err := tsHubLocalBridge(snapshot, binding.Account, bridge, embedded.Port())
+	if err != nil {
+		return err
+	}
+	runtimeOptions.HubOrderBridge = hubBridge
+	rt, err := s.process.NewRuntime(runtimeOptions)
 	if err != nil {
 		return err
 	}
 	defer func() { rt.Close(); rt.Join() }()
+	// Notifications (rpc_channels) for this execution-backed runtime; never fails the robot.
+	defer attachRuntimeNotifications(rt)()
+	rt.Core.LogFile = s.logArgs.Logfile
+	warnIgnoredExecutionConfig(snapshot.View())
+	// Embedded mode holds the account credentials. The execution-backed order
+	// managers do not honour AccountConfig.NoTrade, so a failed check stops the
+	// robot (fail closed) instead of silently trading a misconfigured account.
+	if checkErr := verifyEmbeddedAccounts(rt.BizDeps()); checkErr != nil {
+		return checkErr
+	}
 	for _, symbol := range binding.Symbols {
 		if err := rt.Symbols.CacheExSymbolChecked(symbol); err != nil {
 			return err
@@ -233,7 +272,7 @@ func (s *explicitEntrySession) runTimeSeriesExecutionAccount(ctx context.Context
 		instruments = append(instruments, unit.Instrument)
 	}
 	if err := account.RegisterAccountQuotes(instruments, func(ctx context.Context, id string, _ int64) (execution.VisibleQuote, error) {
-		return adapter.Observe(ctx, id)
+		return observe(ctx, id)
 	}, rt.Clock.TimeMS); err != nil {
 		return err
 	}
@@ -274,24 +313,28 @@ func (s *explicitEntrySession) runTimeSeriesExecutionAccount(ctx context.Context
 	if err := account.StartReportsContext(ctx); err != nil {
 		return err
 	}
-	if binding.Legacy.automatic {
-		if err := loadMixedLiveJobs(rt, &binding); err != nil {
-			return err
+	if err := bindTimeSeriesJobs(func() error {
+		if binding.Legacy.automatic {
+			return loadMixedLiveJobs(rt, &binding)
 		}
-	} else {
-		if err := rt.BindFactorLegacyJobs(binding.Legacy.Jobs, binding.Legacy.Subscriptions); err != nil {
-			return err
-		}
+		return rt.BindFactorLegacyJobs(binding.Legacy.Jobs, binding.Legacy.Subscriptions)
+	}); err != nil {
+		return err
+	}
+	trader, traderErr := live.NewCryptoTraderWithRuntimeDeps(rt.BizDeps())
+	if traderErr != nil {
+		return traderErr
+	}
+	// The dashboard reads this runtime's projected orders and archived history.
+	if apiErr := trader.StartWebAPI(); apiErr != nil {
+		return apiErr
 	}
 	if startup != nil {
-		trader, err := live.NewCryptoTraderWithRuntimeDeps(rt.BizDeps(), nil)
-		if err != nil {
-			return err
-		}
 		if err := startup(ctx, trader); err != nil {
 			return err
 		}
 	}
+	rt.NotifyStarted()
 	provider, providerErr := rt.NewFactorLiveProvider(func(*orm.DataSeries) {}, nil)
 	if providerErr != nil {
 		return providerErr
@@ -301,24 +344,45 @@ func (s *explicitEntrySession) runTimeSeriesExecutionAccount(ctx context.Context
 		return err
 	}
 	defer func() { installation.Stop(); result = errors.Join(result, installation.Join()) }()
+	startExecutionRobotCrons(rt, trader, provider, binding.Legacy.Subscriptions)
 	reports, err := account.ReportErrors()
 	if err != nil {
 		return err
 	}
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
+	// Funding is recovered by the account's private report worker (on demand
+	// after a cash mismatch and at least every few minutes, tolerating transient
+	// venue errors). A separate 5s poll here exhausted the venue's income rate
+	// limit and froze the account on the first transient failure.
+	//
+	// A failed HubOrderMgr stops the runtime; the account is frozen below.
+	runtimeDone := rt.Context().Done()
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-runtimeDone:
+			err := hubRobotRuntimeError(rt, c.AccountID)
+			if manager, ok := biz.GetOdMgrWithState(rt.Trading, c.AccountID).(*biz.HubOrderMgr); ok && manager.LastError() != nil {
+				err = errors.Join(err, account.FreezeFailure("time-series-hub-facade-error", rt.Clock.TimeMS()))
+			}
+			return err
 		case err := <-reports:
 			return err
 		case err := <-installation.Errors():
 			return errors.Join(err, account.FreezeFailure("time-series-source-error", rt.Clock.TimeMS()))
-		case <-ticker.C:
-			if err := adapter.RecoverCash(ctx, account); err != nil {
-				return errors.Join(err, account.FreezeFailure("time-series-funding-error", rt.Clock.TimeMS()))
-			}
 		}
 	}
+}
+
+// bindTimeSeriesJobs runs the job binding. The Hub order manager is built there
+// and its constructor panics when the one-time legacy checkpoint import refuses
+// an unmappable order; that must fail this account's startup with the cause, not
+// crash the process.
+func bindTimeSeriesJobs(bind func() error) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("time-series execution: Hub order manager startup failed: %v", recovered)
+		}
+	}()
+	return bind()
 }

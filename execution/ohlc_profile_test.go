@@ -4,6 +4,7 @@ import (
 	"math"
 	"testing"
 
+	botexg "github.com/banbox/banbot/exg"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banexg"
 	"github.com/banbox/banexg/errs"
@@ -116,7 +117,7 @@ func TestOHLCProfilePreservesSDKMarketsPrecisionAndFees(t *testing.T) {
 			}
 			for _, orderType := range []string{banexg.OdTypeLimit, banexg.OdTypeMarket, "stop_limit"} {
 				exchange.orderType = &orderType
-				fee, err := LegacyOrderFee(exchange, market.Symbol, &orderType, banexg.OdSideBuy, amount, price)
+				fee, err := botexg.OrderFee(exchange, market.Symbol, &orderType, banexg.OdSideBuy, amount, price)
 				rate := .002
 				if orderType != banexg.OdTypeMarket {
 					rate = .001
@@ -128,7 +129,7 @@ func TestOHLCProfilePreservesSDKMarketsPrecisionAndFees(t *testing.T) {
 			orderType := banexg.OdTypeLimit
 			exchange.orderType = &orderType
 			exchange.feeErr = errs.NewMsg(errs.CodeRunTime, "venue fee failure")
-			_, err = LegacyOrderFee(exchange, market.Symbol, &orderType, banexg.OdSideBuy, amount, price)
+			_, err = botexg.OrderFee(exchange, market.Symbol, &orderType, banexg.OdSideBuy, amount, price)
 			if err != exchange.feeErr || orderType != banexg.OdTypeLimitMaker {
 				t.Fatalf("fee failure lost normalization: type=%s err=%v", orderType, err)
 			}

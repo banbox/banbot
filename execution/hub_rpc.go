@@ -11,10 +11,13 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const hubMaxRequestBytes = 4 << 20
+
+const hubClientTimeout = 30 * time.Second
 
 type hubRPCRequest struct {
 	Account      AccountKey
@@ -28,6 +31,7 @@ type hubRPCRequest struct {
 	Pending      *PendingCommand
 	TSProjection *TimeSeriesProjectionRequest
 	TSExit       *TimeSeriesExitCommand
+	TSTakeover   *TimeSeriesTakeoverBinding
 	Policy       *PolicyAcceptance
 	Strategy     StrategyID
 	PolicyResume *HubPolicyResume
@@ -40,6 +44,13 @@ type hubRPCRequest struct {
 	TargetResume *HubTargetResume
 	Side         OrderSide
 	WaitSeconds  int
+	LossStop     *LossStopPolicy
+	Admission    *hubAdmissionRequest
+}
+
+type hubAdmissionRequest struct {
+	Registrant string
+	Policy     AdmissionPolicy
 }
 
 type hubRPCResponse struct {
@@ -66,7 +77,14 @@ type hubRPCResponse struct {
 	CancellationRecoveryRequired bool                      `json:",omitempty"`
 	TargetRecovery               *HubTargetRecovery        `json:",omitempty"`
 	TargetSendFailed             bool                      `json:",omitempty"`
+	LossStop                     *LossStopStatus           `json:",omitempty"`
+	AdmissionStatus              *AdmissionStatus          `json:",omitempty"`
+	// Rejected is a fixed code, never error text: the command was refused
+	// before any commit and must not be retried unchanged.
+	Rejected string `json:",omitempty"`
 }
+
+const hubRejectedVenueMinimum = "venue_minimum"
 
 // HubServer uses a private local socket, not the spider's public subscription
 // broadcast. Possession of this same-user socket authorizes account operations.
@@ -79,6 +97,20 @@ type HubServer struct {
 	done      chan struct{}
 	closeOnce sync.Once
 	closeErr  error
+	onError   atomic.Pointer[func(path string, err error)]
+}
+
+// SetErrorObserver installs the host's sink for operation failures. The RPC
+// reply never carries their text (factory and SDK errors may embed
+// credentials), so without a host-side record an operator cannot tell why an
+// account failed to register. The observer runs on the request goroutine and
+// receives the raw error: the host must keep it out of anything it publishes.
+func (s *HubServer) SetErrorObserver(observe func(path string, err error)) {
+	if observe == nil {
+		s.onError.Store(nil)
+		return
+	}
+	s.onError.Store(&observe)
 }
 
 func ListenHubUnix(path string, hub *Hub) (*HubServer, error) {
@@ -161,6 +193,26 @@ func (s *HubServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		result.Snapshot = &snapshot
 	case "/v1/recovery_status":
 		result.Recovery, err = s.hub.RecoveryStatuses(r.Context())
+	case "/v1/set-loss-stop":
+		if request.LossStop == nil {
+			err = errors.New("execution: loss stop policy required")
+		} else {
+			err = s.hub.SetLossStopPolicy(r.Context(), request.Account, *request.LossStop)
+		}
+	case "/v1/loss-stop":
+		var status LossStopStatus
+		status, err = s.hub.LossStopStatus(r.Context(), request.Account)
+		result.LossStop = &status
+	case "/v1/set-admission":
+		if request.Admission == nil {
+			err = errors.New("execution: admission policy required")
+		} else {
+			err = s.hub.SetAdmissionPolicy(r.Context(), request.Account, request.Admission.Registrant, request.Admission.Policy)
+		}
+	case "/v1/admission":
+		var status AdmissionStatus
+		status, err = s.hub.AdmissionStatus(r.Context(), request.Account)
+		result.AdmissionStatus = &status
 	case "/v1/account-risk":
 		var risk PortfolioRisk
 		risk, err = s.hub.AccountRisk(r.Context(), request.Account)
@@ -221,6 +273,12 @@ func (s *HubServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			page, err = s.hub.TimeSeriesProjection(r.Context(), request.Account, *request.TSProjection)
 			result.TSProjection = &page
 		}
+	case "/v1/ts-takeover-bind":
+		if request.TSTakeover == nil {
+			err = errors.New("missing time-series takeover binding")
+		} else {
+			err = s.hub.BindTimeSeriesTakeover(r.Context(), request.Account, *request.TSTakeover)
+		}
 	case "/v1/ts-exit":
 		if request.TSExit == nil {
 			err = errors.New("missing time-series exit command")
@@ -266,31 +324,64 @@ func (s *HubServer) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		if result.Policy != nil && result.Policy.Accepted {
-			result.PolicySendFailed = true
-			_ = json.NewEncoder(w).Encode(result)
+		reply, ok := hubFailureReply(r.URL.Path, request, result, err, s.onError.Load())
+		if !ok {
+			http.Error(w, "hub operation failed; inspect account recovery state before retrying", http.StatusConflict)
 			return
 		}
-		if errors.Is(err, ErrPolicyCancellationRecoveryRequired) {
-			result.CancellationRecoveryRequired = true
-			_ = json.NewEncoder(w).Encode(result)
-			return
-		}
-		if result.TargetRecovery != nil && result.TargetRecovery.Found {
-			result.TargetSendFailed = true
-			_ = json.NewEncoder(w).Encode(result)
-			return
-		}
-		if errors.Is(err, ErrPolicyEvidenceChanged) {
-			result.EvidenceChanged = true
-			_ = json.NewEncoder(w).Encode(result)
-			return
-		}
-		// Factory/SDK errors may embed credentials. Never expose their text.
-		http.Error(w, "hub operation failed; inspect account recovery state before retrying", http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(reply)
 		return
 	}
 	_ = json.NewEncoder(w).Encode(result)
+}
+
+// hubFailureReply maps a failed owner operation to the only thing a robot may
+// learn about it: a reply carrying fixed flags/codes (ok), or nothing (!ok),
+// which is the generic failure. Factory/SDK errors may embed credentials, so
+// their text never leaves; the host observer receives the raw error instead.
+func hubFailureReply(path string, request hubRPCRequest, result hubRPCResponse, err error, observe *func(path string, err error)) (hubRPCResponse, bool) {
+	if result.Policy != nil && result.Policy.Accepted {
+		result.PolicySendFailed = true
+		return result, true
+	}
+	if errors.Is(err, ErrPolicyCancellationRecoveryRequired) {
+		result.CancellationRecoveryRequired = true
+		return result, true
+	}
+	if result.TargetRecovery != nil && result.TargetRecovery.Found {
+		result.TargetSendFailed = true
+		return result, true
+	}
+	if errors.Is(err, ErrPolicyEvidenceChanged) {
+		result.EvidenceChanged = true
+		return result, true
+	}
+	if observe != nil {
+		(*observe)(path, err)
+	}
+	if code := hubRPCRejection(path, request, err); code != "" {
+		return hubRPCResponse{Rejected: code}, true
+	}
+	return hubRPCResponse{}, false
+}
+
+// hubReplyError is the client-side decoding of a reply's fixed flags and codes.
+func hubReplyError(result hubRPCResponse) error {
+	var err error
+	if result.CancellationRecoveryRequired {
+		err = ErrPolicyCancellationRecoveryRequired
+	}
+	if err == nil && result.Rejected == hubRejectedVenueMinimum {
+		err = ErrVenueMinimum
+	} else if err == nil && hubRejectCodes[result.Rejected] {
+		err = &RejectedError{Code: result.Rejected, Err: errors.New("execution: hub rejected the command: " + result.Rejected)}
+	} else if err == nil && result.Rejected != "" {
+		err = errors.New("execution: hub rejected the command")
+	}
+	if err == nil && result.TargetSendFailed {
+		err = errors.New("execution: accepted hub target send requires account recovery")
+	}
+	return err
 }
 
 func (s *HubServer) Close() error {
@@ -314,7 +405,7 @@ func NewHubClient(socketPath string) *HubClient {
 	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
 	}}
-	return &HubClient{client: &http.Client{Transport: transport, Timeout: 30 * time.Second}, transport: transport}
+	return &HubClient{client: &http.Client{Transport: transport, Timeout: hubClientTimeout}, transport: transport}
 }
 
 // Close only releases client connections. Accepted hub accounts remain active.
@@ -346,11 +437,8 @@ func (c *HubClient) call(ctx context.Context, method string, request hubRPCReque
 		return result, errors.New("execution: hub operation failed; inspect account recovery state before retrying")
 	}
 	err = json.NewDecoder(io.LimitReader(response.Body, 64<<20)).Decode(&result)
-	if err == nil && result.CancellationRecoveryRequired {
-		err = ErrPolicyCancellationRecoveryRequired
-	}
-	if err == nil && result.TargetSendFailed {
-		err = errors.New("execution: accepted hub target send requires account recovery")
+	if err == nil {
+		err = hubReplyError(result)
 	}
 	return result, err
 }
@@ -436,6 +524,38 @@ func (c *HubClient) ClaimStrategyWriter(ctx context.Context, account AccountKey,
 func (c *HubClient) RecoveryStatuses(ctx context.Context) ([]HubRecoveryStatus, error) {
 	result, err := c.call(ctx, "recovery_status", hubRPCRequest{})
 	return result.Recovery, err
+}
+
+func (c *HubClient) SetLossStopPolicy(ctx context.Context, account AccountKey, policy LossStopPolicy) error {
+	_, err := c.call(ctx, "set-loss-stop", hubRPCRequest{Account: account, LossStop: &policy})
+	return err
+}
+
+func (c *HubClient) LossStopStatus(ctx context.Context, account AccountKey) (LossStopStatus, error) {
+	result, err := c.call(ctx, "loss-stop", hubRPCRequest{Account: account})
+	if err != nil {
+		return LossStopStatus{}, err
+	}
+	if result.LossStop == nil {
+		return LossStopStatus{}, errors.New("execution: hub returned no loss stop status")
+	}
+	return *result.LossStop, nil
+}
+
+func (c *HubClient) SetAdmissionPolicy(ctx context.Context, account AccountKey, registrant string, policy AdmissionPolicy) error {
+	_, err := c.call(ctx, "set-admission", hubRPCRequest{Account: account, Admission: &hubAdmissionRequest{Registrant: registrant, Policy: policy}})
+	return err
+}
+
+func (c *HubClient) AdmissionStatus(ctx context.Context, account AccountKey) (AdmissionStatus, error) {
+	result, err := c.call(ctx, "admission", hubRPCRequest{Account: account})
+	if err != nil {
+		return AdmissionStatus{}, err
+	}
+	if result.AdmissionStatus == nil {
+		return AdmissionStatus{}, errors.New("execution: hub returned no admission status")
+	}
+	return *result.AdmissionStatus, nil
 }
 
 func (c *HubClient) AccountRisk(ctx context.Context, account AccountKey) (PortfolioRisk, error) {

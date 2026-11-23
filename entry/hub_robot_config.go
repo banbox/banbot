@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"sort"
 
@@ -16,7 +17,10 @@ import (
 	"github.com/banbox/banbot/factor/runner"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banexg"
+	"github.com/banbox/banexg/log"
+	"github.com/go-viper/mapstructure/v2"
 	"github.com/shopspring/decimal"
+	"go.uber.org/zap"
 )
 
 func robotHubSocket(spec *config.RunSpec, account, dataDir string) (string, error) {
@@ -143,7 +147,14 @@ func registerRobotHubAccount(ctx context.Context, client *execution.HubClient, s
 			request.Risk.StrategyGrossLimits[id] = binding.Legacy.Bridge.Risk.StrategyGrossLimits[id]
 		}
 	}
+	leverage, err := declaredAccountLeverage(cfg, key.Account)
+	if err != nil {
+		return key, err
+	}
 	for _, unit := range units {
+		if unit.Leverage == 0 {
+			unit.Leverage = leverage
+		}
 		request.Instruments = append(request.Instruments, unit)
 	}
 	sort.Slice(request.Instruments, func(i, j int) bool {
@@ -167,7 +178,20 @@ func registerRobotHubAccount(ctx context.Context, client *execution.HubClient, s
 			nav = first.InitialNAV
 		}
 		request.PaperCash = decimal.NewFromFloat(nav)
-		request.PaperFee = decimal.NewFromFloat(first.Manifest.Costs.FeeRate)
+		feeRate := first.Manifest.Costs.FeeRate
+		if feeRate == 0 && pureTimeSeriesAccount(configs) {
+			// A time-series account declares no factor cost model; without this
+			// its simulated fills would be free. Use the taker fee the exchange
+			// section configures for this market, as the wallet-based dry run did.
+			var feeErr error
+			if feeRate, feeErr = configuredTakerFee(cfg); feeErr != nil {
+				return key, feeErr
+			}
+			if feeRate == 0 {
+				log.Warn("dry_run fills are simulated without fees: set exchange.<name>.fees.<market>.taker", zap.String("account", key.Account), zap.String("exchange", cfg.Exchange.Name), zap.String("market", cfg.MarketType))
+			}
+		}
+		request.PaperFee = decimal.NewFromFloat(feeRate)
 		request.PaperSlippage = decimal.NewFromFloat(first.Manifest.Costs.SlippageRate)
 		for _, c := range configs {
 			if c.Manifest.Costs.FeeRate != first.Manifest.Costs.FeeRate || c.Manifest.Costs.SlippageRate != first.Manifest.Costs.SlippageRate {
@@ -181,4 +205,57 @@ func registerRobotHubAccount(ctx context.Context, client *execution.HubClient, s
 	}
 	err = client.Register(ctx, execution.HubAccountRegistration{Account: key, Env: cfg.Env, Configuration: body})
 	return key, err
+}
+
+// declaredAccountLeverage is the fixed venue leverage declared for every
+// instrument of an account: accounts.<name>.leverage, else the root leverage.
+// Zero leaves the venue setting untouched.
+func declaredAccountLeverage(cfg *config.Config, account string) (int, error) {
+	if cfg == nil {
+		return 0, nil
+	}
+	value := cfg.Leverage
+	if acc := cfg.Accounts[account]; acc != nil && acc.Leverage > 0 {
+		value = acc.Leverage
+	}
+	if value == 0 {
+		return 0, nil
+	}
+	if value < 1 || value > 125 || value != math.Trunc(value) {
+		return 0, fmt.Errorf("hub robot: account %s leverage %v must be a whole number between 1 and 125", account, value)
+	}
+	return int(value), nil
+}
+
+// pureTimeSeriesAccount reports whether no factor strategy contributes to the
+// account: time-series accounts are declared with an empty strategy ID.
+func pureTimeSeriesAccount(configs []runner.Config) bool {
+	for _, c := range configs {
+		if c.StrategyID != "" {
+			return false
+		}
+	}
+	return len(configs) > 0
+}
+
+// configuredTakerFee reads exchange.<name>.fees.<market>.taker, the same
+// option the exchange session uses to calculate fees. A missing section yields
+// zero; a malformed or out-of-range value is an error.
+func configuredTakerFee(cfg *config.Config) (float64, error) {
+	if cfg == nil || cfg.Exchange == nil {
+		return 0, nil
+	}
+	raw, ok := cfg.Exchange.Items[cfg.Exchange.Name]["fees"]
+	if !ok || raw == nil {
+		return 0, nil
+	}
+	var fees map[string]map[string]float64
+	if err := mapstructure.Decode(raw, &fees); err != nil {
+		return 0, fmt.Errorf("hub robot: invalid exchange.%s.fees: %w", cfg.Exchange.Name, err)
+	}
+	taker := fees[cfg.MarketType]["taker"]
+	if taker < 0 || taker >= 1 || math.IsNaN(taker) {
+		return 0, fmt.Errorf("hub robot: exchange.%s.fees.%s.taker must be a rate in [0, 1): %v", cfg.Exchange.Name, cfg.MarketType, taker)
+	}
+	return taker, nil
 }

@@ -45,7 +45,14 @@ func BridgeTimeSeriesEntryCommand(c IntentBridgeContext, exs *orm.ExSymbol, time
 	// A robot quote's Bar is not the hub's expiry clock. Feed identity/countdown
 	// is bound atomically by the owner against its persisted feed progress.
 	conditions.StopBars, conditions.CreatedBar = 0, 0
-	create := &execution.PendingCreateSpec{Instrument: c.Instrument, Side: bridged.Intent.Side, QuantitySteps: bridged.Intent.QuantitySteps, Conditions: conditions, Policy: policy, Protections: sharedProtectionSpecs(bridged.Original)}
+	protections := sharedProtectionSpecs(bridged.Original)
+	if ladder, lerr := newHubLadder(&bridged.Original, hubLadderReference(&bridged.Original, c.ReferencePrice.InexactFloat64())); lerr != nil {
+		return command, lerr
+	} else if ladder != nil {
+		// The first rung is the lot's take-profit; later rungs are installed by the robot.
+		protections = ladderSpecsFromBase(*ladder, protections)
+	}
+	create := &execution.PendingCreateSpec{Instrument: c.Instrument, Side: bridged.Intent.Side, QuantitySteps: bridged.Intent.QuantitySteps, Conditions: conditions, Policy: policy, Protections: protections, OCOGroup: req.OCOGroup}
 	if req.StopBars > 0 {
 		create.Feed = execution.PendingFeedID(sharedFeedKey(exs.ID, timeframe))
 		create.StopBars = int64(req.StopBars)
