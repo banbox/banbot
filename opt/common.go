@@ -1,6 +1,7 @@
 package opt
 
 import (
+	"cmp"
 	_ "embed"
 	"fmt"
 	"maps"
@@ -331,7 +332,7 @@ Divide the parameter group into profit and loss groups, both in descending order
 */
 func DescGroups(items []*OptInfo) ([]*OptInfo, []*OptInfo) {
 	slices.SortFunc(items, func(a, b *OptInfo) int {
-		return int(b.Score - a.Score)
+		return cmp.Compare(b.Score, a.Score)
 	})
 	for i, it := range items {
 		if it.Score < 0 {

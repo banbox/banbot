@@ -2,6 +2,7 @@ package opt
 
 import (
 	"bytes"
+	"cmp"
 	"fmt"
 	"io/fs"
 	"math"
@@ -194,7 +195,7 @@ func RunRollBTPicker(args *config.CmdArgs, snapshot *config.Snapshot, factory Ba
 			items = append(items, &ValItem{Tag: picker, Score: score, Order: i})
 		}
 		slices.SortFunc(items, func(a, b *ValItem) int {
-			return int(b.Score - a.Score)
+			return cmp.Compare(b.Score, a.Score)
 		})
 		for i, it := range items {
 			it.Res = i
