@@ -77,4 +77,6 @@ package core
 //	   baseline rate that longs pay (negative exit-leg funding cost, zero net funding drift on equal-notional long+short hedges;
 //	   bt_legacy_approx_funding: true restores pre-level-15 unilateral long-only charging); strategy-level TradeStrat.RefineTF
 //	   defaults and causal refine_tf sub-bar OnOrderChange replenishment
-const BtFeatureLevel = 15
+//	16 strategy API: btime.BarInUTCWindow / btime.BarTouchesUTCWeekdays (bar-overlap session and weekday filters). Backtest
+//	   behaviour is identical to level 15; generated strategies may call the helpers only on builds >= 16
+const BtFeatureLevel = 16
