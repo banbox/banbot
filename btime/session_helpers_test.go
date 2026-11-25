@@ -222,3 +222,55 @@ func TestIsNearSessionEndMultiTimeframe(t *testing.T) {
 		t.Fatal("3d bar must return false for IsNearSessionEnd")
 	}
 }
+
+func TestBarInUTCWindow(t *testing.T) {
+	day := int64(20000) * DayMS // a Thursday-aligned UTC midnight multiple
+	h := HourMS
+	cases := []struct {
+		start, stop int64
+		s, e        int
+		want        bool
+	}{
+		{day + 7*h, day + 8*h, 7 * 60, 9 * 60, true},             // 1h bar starts in window
+		{day + 6*h, day + 7*h, 7 * 60, 9 * 60, false},            // ends exactly at window open
+		{day + 6*h, day + 7*h + MinuteMS, 7 * 60, 9 * 60, true},  // reaches into window
+		{day + 9*h, day + 10*h, 7 * 60, 9 * 60, false},           // after window
+		{day + 0, day + 8*h, 7 * 60, 9 * 60, true},               // 8h bar covers window open
+		{day + 16*h, day + 24*h, 7 * 60, 9 * 60, false},          // 8h bar without the window
+		{day, day + DayMS, 7 * 60, 9 * 60, true},                 // 1d bar
+		{day, day + 3*DayMS, 13*60 + 30, 14 * 60, true},          // 3d bar
+		{day + 23*h, day + 24*h, 22 * 60, 2 * 60, true},          // cross-midnight window
+		{day + 2*h, day + 3*h, 22 * 60, 2 * 60, false},           // just after cross-midnight window
+		{day + 20*h, day + 24*h, 22 * 60, 2 * 60, true},          // 4h bar into cross-midnight window
+		{day + 7*h, day + 8*h, 7 * 60, 7 * 60, false},            // zero width
+		{day + 7*h, day + 7*h, 7 * 60, 9 * 60, true},             // degenerate bar -> InUTCWindow
+	}
+	for i, c := range cases {
+		if got := BarInUTCWindow(c.start, c.stop, c.s, c.e); got != c.want {
+			t.Errorf("case %d: got %v want %v", i, got, c.want)
+		}
+	}
+}
+
+func TestBarTouchesUTCWeekdays(t *testing.T) {
+	// 1970-01-05 was a Monday
+	mon := int64(4) * DayMS
+	if !BarTouchesUTCWeekdays(mon, mon+HourMS, time.Monday) || BarTouchesUTCWeekdays(mon, mon+HourMS, time.Tuesday) {
+		t.Fatal("intraday bar weekday")
+	}
+	// 3d bar Sat..Mon covers Monday
+	sat := mon - 2*DayMS
+	if !BarTouchesUTCWeekdays(sat, sat+3*DayMS, time.Monday) || BarTouchesUTCWeekdays(sat, sat+3*DayMS, time.Wednesday) {
+		t.Fatal("3d bar weekday")
+	}
+	if BarTouchesUTCWeekdays(mon, mon+DayMS, time.Tuesday) {
+		t.Fatal("bar ending at Tuesday 00:00 must not count Tuesday")
+	}
+	if BarTouchesUTCWeekdays(mon, mon+DayMS) {
+		t.Fatal("no weekdays")
+	}
+	// pre-1970: 1969-12-27 (day -5) was a Saturday
+	if !BarTouchesUTCWeekdays(-5*DayMS, -4*DayMS, time.Saturday) || BarTouchesUTCWeekdays(-5*DayMS, -4*DayMS, time.Sunday) {
+		t.Fatal("negative day weekday")
+	}
+}

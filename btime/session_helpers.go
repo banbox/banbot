@@ -1,5 +1,7 @@
 package btime
 
+import "time"
+
 // Time unit constants in milliseconds and minutes for UTC session calculations.
 const (
 	MinuteMS      int64 = 60_000
@@ -174,4 +176,68 @@ func IsNearSessionEnd(barStartMS, barStopMS int64, closeMinutesUTC int) bool {
 		return euclidModInt64(barStopMS-closeMS, DayMS) == 0
 	}
 	return SessionDayIndex(barStartMS, closeMinutesUTC) < SessionDayIndex(barStopMS, closeMinutesUTC)
+}
+
+// BarInUTCWindow reports whether the bar [barStartMS, barStopMS) overlaps the
+// daily UTC window [startMin, endMin) (same window rules as InUTCWindow).
+//
+// It is the timeframe-independent form of a session/entry-window filter: on
+// bars shorter than the window it is true exactly for the bars that start in
+// (or reach into) the window, and a bar at least as long as the gap between
+// two windows (e.g. 4h/8h/1d/3d bars for a 2h window) always overlaps one, so
+// the filter never blocks every bar of a coarse timeframe.
+// A zero-width window returns false; barStopMS <= barStartMS falls back to
+// InUTCWindow(barStartMS, ...).
+func BarInUTCWindow(barStartMS, barStopMS int64, startMin, endMin int) bool {
+	if endMin-startMin >= MinutesPerDay {
+		return true
+	}
+	s, e := NormalizeDayMinutes(startMin), NormalizeDayMinutes(endMin)
+	if startMin == endMin || s == e {
+		return false
+	}
+	if InUTCWindow(barStartMS, startMin, endMin) {
+		return true
+	}
+	if barStopMS <= barStartMS {
+		return false
+	}
+	if barStopMS-barStartMS >= DayMS {
+		return true
+	}
+	// barStart is outside the window, so the window that started last has ended:
+	// the bar overlaps the window only if the next window opens before the bar closes.
+	next := SessionStartMS(barStartMS, s)
+	if next <= barStartMS {
+		next += DayMS
+	}
+	return next < barStopMS
+}
+
+// BarTouchesUTCWeekdays reports whether the bar [barStartMS, barStopMS) covers
+// any moment of one of the given UTC weekdays. On 1d/3d bars a weekday filter
+// therefore keeps the bars that contain an allowed day instead of depending on
+// the weekday the bar happens to open on. barStopMS <= barStartMS checks the
+// weekday of barStartMS only.
+func BarTouchesUTCWeekdays(barStartMS, barStopMS int64, days ...time.Weekday) bool {
+	if len(days) == 0 {
+		return false
+	}
+	first := euclidDivInt64(barStartMS, DayMS)
+	last := first
+	if barStopMS > barStartMS {
+		last = euclidDivInt64(barStopMS-1, DayMS)
+	}
+	if last-first >= 6 {
+		return true
+	}
+	for d := first; d <= last; d++ {
+		wd := time.Weekday(euclidModInt64(d+4, 7)) // 1970-01-01 (day 0) was a Thursday; Euclidean mod keeps pre-1970 days in [0, 6]
+		for _, want := range days {
+			if wd == want {
+				return true
+			}
+		}
+	}
+	return false
 }
