@@ -211,7 +211,7 @@ func (e *OwnerExecutor) prepareRebalance(request CombinedRebalance, checkpoints 
 					return err
 				}
 				for _, leg := range coordination.Legs {
-					if leg.Steps < r.Instrument.MinSteps || r.Instrument.Notional(leg.Steps, price).LessThan(r.Instrument.MinNotional) {
+					if leg.Steps < r.Instrument.MinSteps || !leg.ReduceOnly && r.Instrument.Notional(leg.Steps, price).LessThan(r.Instrument.MinNotional) {
 						return &venueMinimumError{Instrument: r.Instrument.ID}
 					}
 				}

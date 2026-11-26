@@ -309,6 +309,8 @@ Set per-policy sizing multipliers with `run_policy[].stake_rate`.
 
 On the default Hub live path `leverage` (account level overrides the root value; a whole number from 1 to 125) is the fixed leverage of every instrument of that account. It is declared with the account registration and set at the venue per instrument by the Hub account owner when the account comes online; if the venue refuses, the account does not come online. It only sets the venue margin multiple and does not scale order notional; `execution.margin_rate >= 1/leverage` is required. A per-order `Leverage` in a strategy request is still rejected. Leverage is part of the account registration, so changing it follows the account configuration change procedure. Embedded execution providers do not support declared leverage.
 
+Changed `max_open_orders`, `max_simul_open` and policy `max_open` / `max_simul_open` take effect after a restart: the Hub path adopts the configured limits over those saved in the robot journal and logs one warning (old -> new). dry_run rejects a per-order `Leverage` just like prod.
+
 #### Keys with no effect on the default Hub live path
 The default prod / dry-run path (shared account and Hub) does not run the legacy wallet and pair-rotation machinery. These keys are accepted but ignored; startup logs one warning per key whose value you changed (zero values and defaults are not reported):
 

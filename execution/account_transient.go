@@ -29,7 +29,7 @@ const fundingRetryBackoff = 30 * time.Second
 // private report worker (balance, positions, all open and conditional orders).
 // Account-change wake-ups, order reports and transient outages reconcile
 // sooner; ticks in between only advance pending execution.
-const privateReconcileInterval = 30 * time.Second
+var privateReconcileInterval = 30 * time.Second
 
 // rateLimitDefaultPause is used when a rate-limit error carries no Retry-After.
 const rateLimitDefaultPause = 30 * time.Second

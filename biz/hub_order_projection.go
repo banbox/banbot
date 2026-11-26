@@ -30,6 +30,25 @@ type hubProjectedLot struct {
 	// sequence. Explicit strategy exits carry their tag in Record.Metadata.
 	AutoExitTag  string   `json:",omitempty"`
 	AutoExitTags []string `json:",omitempty"`
+	// StratInfo holds the Info keys a strategy wrote with SetInfo (JSON form; a
+	// nil value hides an entry-request key). The view is rebuilt from the journal
+	// every poll, so they are re-applied to each rebuilt view.
+	StratInfo map[string]any `json:",omitempty"`
+	// MaxPftRate/MaxDrawDown are the running extremes of the view's profit.
+	MaxPftRate, MaxDrawDown float64 `json:",omitempty"`
+	// ExitSig/ExitFull: the last explicit reduction command (tag/size) and whether
+	// it covered the whole position held when it was accepted.
+	ExitSig  string `json:",omitempty"`
+	ExitFull bool   `json:",omitempty"`
+	// EndTag/EndReason/EndCancel/EndMS describe why an entry that never filled
+	// ended (hub_order_entry_end.go): the LocalOrderMgr exit tag, the owner's
+	// reason code or message, whether the strategy itself cancelled it, and when.
+	// EndNotified is set in the same journal save that queues the OdChgExitFill
+	// delivery, so the callback is produced exactly once.
+	EndTag, EndReason string `json:",omitempty"`
+	EndCancel         bool   `json:",omitempty"`
+	EndMS             int64  `json:",omitempty"`
+	EndNotified       bool   `json:",omitempty"`
 }
 
 // protectionExitTagLocked names the protection that executed the exit fill being
@@ -104,6 +123,9 @@ func (m *HubOrderMgr) poll(restore bool) error {
 	m.pollDone = make(chan struct{})
 	m.mu.Unlock()
 	defer func() { m.mu.Lock(); m.polling = false; close(m.pollDone); m.mu.Unlock() }()
+	if !restore {
+		m.deliverDrops(true)
+	}
 	if err := m.deliverPending(); err != nil {
 		return err
 	}
@@ -224,6 +246,9 @@ func (m *HubOrderMgr) poll(restore bool) error {
 				} else if event.Kind == "StrategyAccepted" {
 					lot.Record = record
 				}
+				if event.Kind == "StrategyAccepted" && accepted.Strategy == key.Strategy && accepted.Lot == key.Lot {
+					m.captureEntryEndLocked(lot, accepted)
+				}
 				for _, entry := range event.Ledger {
 					if entry.Strategy != key.Strategy || entry.Lot != key.Lot {
 						continue
@@ -275,7 +300,7 @@ func (m *HubOrderMgr) poll(restore bool) error {
 					}
 					deliveries = append(deliveries, hubOrderDelivery{visible, kind, fmt.Sprintf("%s/%d", event.ID, entry.ID), true, isEnter})
 				}
-				if event.Kind == "StrategyAccepted" && !hubFollowupID(accepted.CommandID) {
+				if event.Kind == "StrategyAccepted" && !hubFollowupID(accepted.CommandID) && !hubEditID(accepted.CommandID) {
 					visible, e := m.viewLocked(lot, false)
 					if e != nil {
 						m.mu.Unlock()
@@ -288,7 +313,10 @@ func (m *HubOrderMgr) poll(restore bool) error {
 					visible.Info["shared_event_id"] = event.ID
 					deliveries = append(deliveries, hubOrderDelivery{Order: visible, Kind: kind, ID: event.ID})
 				}
-				if event.Kind == "OrderState" {
+				// An unfilled entry that ended is reported once, by its OdChgExitFill at
+				// the end of the page (as LocalOrderMgr does); its order-state events
+				// would only show a dead order.
+				if event.Kind == "OrderState" && !m.entryEndedLocked(k, lot, 0) {
 					visible, e := m.viewLocked(lot, false)
 					if e != nil {
 						m.mu.Unlock()
@@ -339,9 +367,12 @@ func (m *HubOrderMgr) poll(restore bool) error {
 				return e
 			}
 		}
+		complete := m.journal.Cursor >= page.Snapshot.Checkpoint
+		var endDeliveries []hubOrderDelivery
 		for key, lot := range m.journal.Lots {
 			_, active := m.pending[key]
 			lot.Terminal = !active && held[key] == 0
+			newEnd := complete && m.markEntryEndLocked(key, lot, held[key])
 			od, e := m.viewLocked(lot, true)
 			if e != nil {
 				m.mu.Unlock()
@@ -362,6 +393,18 @@ func (m *HubOrderMgr) poll(restore bool) error {
 			lock.Lock()
 			ods[od.ID] = od
 			lock.Unlock()
+			// Journals written before entry-end callbacks existed hold ended lots
+			// that were announced differently: they are marked, not announced.
+			if newEnd && !restore && m.journal.EndNotifyInit {
+				endDeliveries = append(endDeliveries, hubOrderDelivery{Order: od, Kind: strat.OdChgExitFill, ID: hubEndDeliveryID(lot), Fill: lot.EndCancel})
+			}
+		}
+		if complete {
+			m.journal.EndNotifyInit = true
+		}
+		if len(endDeliveries) > 0 {
+			sort.Slice(endDeliveries, func(i, j int) bool { return endDeliveries[i].ID < endDeliveries[j].ID })
+			m.journal.PendingDeliveries = append(m.journal.PendingDeliveries, endDeliveries...)
 		}
 		m.publishJobsLocked()
 		if page.Reconciled {
@@ -372,6 +415,11 @@ func (m *HubOrderMgr) poll(restore bool) error {
 		m.mu.Unlock()
 		if err != nil {
 			return err
+		}
+		if len(endDeliveries) > 0 {
+			if err := m.deliverPending(); err != nil {
+				return err
+			}
 		}
 		if cursor > page.Cursor {
 			if err := m.config.Client.AdvanceProjection(m.ctx, m.config.Account, name, cursor); err != nil {
@@ -531,6 +579,7 @@ type hubOrderDelivery struct {
 func (m *HubOrderMgr) deliver(d hubOrderDelivery) {
 	d.Order = d.Order.Clone()
 	d.Order.BindState(m.deps.Orders)
+	d.Order.SetInfoHook(m.infoHook(d.Order.ID))
 	for _, key := range []string{ormo.OdInfoStopLoss, ormo.OdInfoTakeProfit} {
 		if value, ok := d.Order.Info[key]; ok {
 			if typed, ok := value.(*ormo.TriggerState); ok {
@@ -585,12 +634,18 @@ func (m *HubOrderMgr) viewLocked(lot *hubProjectedLot, latest bool) (*ormo.InOut
 		return nil, errors.New("biz: projected Hub instrument is undeclared")
 	}
 	p := m.pending[hubLotKey(lot.Record.Strategy, lot.Record.Lot)]
+	m.captureExitScopeLocked(lot)
 	amount := req.Amount
 	if payload.QuantitySteps > 0 {
 		amount = decimal.NewFromInt(payload.QuantitySteps).Mul(instrument.QuantityStep).InexactFloat64()
 	}
 	if payload.QuantitySteps == 0 && p.Order.Entry.QuantitySteps > 0 {
 		amount = decimal.NewFromInt(p.Order.Entry.QuantitySteps).Mul(instrument.QuantityStep).InexactFloat64()
+	}
+	// An entry whose remainder was cancelled/expired will never fill further:
+	// what was entered is the order's size (the payload keeps the original size).
+	if latest && lot.Entered > 0 && (p.Order.Canceled || p.Order.Entry.State == execution.Canceled || p.Order.Entry.State == execution.Expired || p.Order.Entry.State == execution.Filled) {
+		amount = decimal.NewFromInt(lot.Entered).Mul(instrument.QuantityStep).InexactFloat64()
 	}
 	if amount == 0 {
 		amount = decimal.NewFromInt(lot.Entered).Mul(instrument.QuantityStep).InexactFloat64()
@@ -600,6 +655,9 @@ func (m *HubOrderMgr) viewLocked(lot *hubProjectedLot, latest bool) (*ormo.InOut
 	for k, v := range payload.SourceInfo {
 		od.Info[k] = v
 	}
+	m.drainStratInfoLocked(lot, r.OrderID, payload.SourceInfo)
+	overlayStratInfo(od, lot)
+	od.SetInfoHook(m.infoHook(r.OrderID))
 	od.Info["shared_lot"], od.Info["shared_checkpoint"] = string(lot.Record.Lot), m.journal.Cursor
 	od.InitPrice, od.EnterAt, od.Stop = r.InitPrice.InexactFloat64(), r.CreatedMS, req.Stop
 	if req.OrderType < 0 || req.OrderType >= len(core.OrderTypeEnums) {
@@ -684,12 +742,29 @@ func (m *HubOrderMgr) viewLocked(lot *hubProjectedLot, latest bool) (*ormo.InOut
 	// A protection-closed lot is labelled with the reason of its last reduction.
 	// Partial reductions stay untagged (a tag marks the order closed for
 	// CanClose); their sequence is kept in Info. Explicit exit tags win.
-	if len(lot.AutoExitTags) > 0 {
-		od.Info["exit_tags"] = append([]string(nil), lot.AutoExitTags...)
+	tags := append([]string(nil), lot.AutoExitTags...)
+	if od.ExitTag != "" && r.ExitQuantitySteps > 0 && !lot.ExitFull {
+		// The explicit command reduced only part of the position. In backtest the
+		// reduced part is split off and the rest stays untagged, so the remainder
+		// remains open to custom exits (CanClose). A protection that ends the lot
+		// later labels it; otherwise the last explicit tag stays.
+		if od.Status == ormo.InOutStatusFullExit && lot.AutoExitTag != "" {
+			od.ExitTag = lot.AutoExitTag
+		} else if od.Status != ormo.InOutStatusFullExit {
+			tags = append(tags, od.ExitTag)
+			od.ExitTag = ""
+		}
+	}
+	if len(tags) > 0 {
+		od.Info["exit_tags"] = tags
 	}
 	if od.ExitTag == "" && od.Status == ormo.InOutStatusFullExit {
 		od.ExitTag = lot.AutoExitTag
 	}
+	if latest {
+		m.applyEntryEndLocked(lot, od)
+	}
+	m.applyProfitsLocked(lot, od, instrument)
 	od.BindState(m.deps.Orders)
 	return od, nil
 }

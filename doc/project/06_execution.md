@@ -52,7 +52,7 @@
 | `intent_store.go` | 意图/快照读写、`StrategyCheckpoint`、`StrategyAcceptedEvent`、`StrategyTotals` |
 | `ledger_types.go` | `Instrument`、`Plan`、`OrderIntent`、`StoredOrder`、`FillReport`、`VirtualLot`、`CashEvent`、`AccountSnapshot`、`RealOrderState` 等核心类型 |
 | `coordinator.go` | `Coordinate`：按账户快照与目标计算每个品种的增减量；`SubmitEligible` |
-| `rebalance.go` | `PrepareRebalance*`、`CombinedRebalance`、`PreparedRebalance`；内部对冲在中间价成交，只为真实残量建单；同一策略在同一计划内平多头 lot 与空头 lot（两侧都是退出意图，如“全部平仓”或多头止盈与空头止损同 tick 触发）也在内部互抵，两个 lot 同价平仓、不产生场所订单，其余同策略相反意图（双向开仓、翻转）仍以 `self_cross` 拒绝；净额后任一真实腿低于品种 `MinSteps`/`MinNotional` 时在准备阶段（尚未提交任何状态）返回 `ErrVenueMinimum` |
+| `rebalance.go` | `PrepareRebalance*`、`CombinedRebalance`、`PreparedRebalance`；内部对冲在中间价成交，只为真实残量建单；同一策略在同一计划内平多头 lot 与空头 lot（两侧都是退出意图，如“全部平仓”或多头止盈与空头止损同 tick 触发）也在内部互抵，两个 lot 同价平仓、不产生场所订单，其余同策略相反意图（双向开仓、翻转）仍以 `self_cross` 拒绝；净额后任一真实腿低于品种 `MinSteps`、或增加敞口的腿（含翻转的增加部分）低于 `MinNotional` 时在准备阶段（尚未提交任何状态）返回 `ErrVenueMinimum`；仅减少净持仓的腿（`ReduceOnly`）不检查 `MinNotional`（场所对 reduce-only 豁免最小名义额，由场所裁决，确定性拒绝记为 `Rejected`），`PrepareOrder` 同此规则，因此止损/退出不会因持仓贬值至最小名义额以下而被拒或冻结账户 |
 | `strategy_rebalance.go` | `StrategyRebalance`（Full/Patch 两种目标更新）、`PrepareStrategies*` |
 | `strategy_writer.go` | `ClaimStrategyWriter`：策略写者 epoch CAS 认领 |
 | `order_policy.go` | `OrderPolicy`：提交与内部撮合的划分（近价限价才可挂单、独占 lot 规则） |
@@ -121,7 +121,7 @@
 |---|---|
 | `paper.go` | `PaperAdapter`：确定性本地撮合（滑点、tick 取整、费用、挂单按可见买卖价触发） |
 | `paper_funding.go` | `ApplyPaperFunding`：模拟资金费 |
-| `paper_persistence.go` | `NewDurablePaperAdapter`：可选的模拟场 SQLite 操作日志与回放 |
+| `paper_persistence.go` | `NewDurablePaperAdapter`：可选的模拟场 SQLite 操作日志与回放；不成交的报价只在内存生效并延迟记录，下一次任何日志操作前合并为一条 `quotes` 操作（每品种仅保留最新一条，按品种 ID 排序，证明在整批应用后计算）；成交报价仍逐条记 `quote`；旧版每报价一条的 `quote` 日志照常回放；崩溃只丢报价新鲜度 |
 | `paper_history.go` | `BindStore`：冷历史读穿透 |
 | `crossvenue.go` / `CROSSVENUE.md` | `CrossVenuePaper`：独立 SQLite 的跨场现货模拟（非 Store，不共享永续 lot） |
 
@@ -178,27 +178,27 @@
 
 3. **发送（`OwnerExecutor.Send`，`adapter.go`）**
    先做只读预检（执行时间、post-only 能力、条件单能力、组合预留 `risk.go`）→ 事务内：确认 `Prepared`、意图仍可用、计划未过期且仍为最新序号、冻结标志、无不确定订单、递增 `Attempt` 并落 `Started` 审计、状态置 `Sending` → **事务提交后**才调用 `Adapter.Submit` → `acknowledge`（写 `ExchangeID` 与状态，之后逐条 `ApplyFill`）。
-   失败路径：提交错误或上下文取消 → `markUncertain`（写 `Unknown`，使用 `context.Background()` 确保持久化）。`Unknown/Sending/CancelPending` 永不被本方法重发。
+   失败路径：提交错误或上下文取消 → `markUncertain`（写 `Unknown`，使用 `context.Background()` 确保持久化）。`Unknown/Sending/CancelPending` 永不被本方法重发。例外：`BanexgAdapter.Submit` 在调用方上下文未取消、且 SDK 错误为 `definiteSubmitRefusal` 认定的统一码（`CodeOrderRejected`、`CodeInsufficientFunds`、`CodeInsufficientMargin`、`CodeReduceOnlyRejected`、`CodePrecisionViolation`、`CodeRiskLimit`、`CodeOrderWouldTrigger`，均只由交易所对该请求的明确错误响应映射而来）时返回 `SubmitReceipt{Rejected: true}`（无场所身份、零成交），`acknowledge` 写 `Rejected`，不留不确定订单、不阻塞后续发送。超时、网络、取消、限频、5xx、`ExecutionUnknown`、`DuplicateRequest`、`ParamInvalid`、`ExchangeError` 等仍为 `Unknown`。
 
 4. **成交入账（`ledger.go:ApplyFill`）**
    事务内：事件 ID 去重 → 读取订单（拒绝 `Prepared`/`Rejected` 订单的成交，见 RECOVERY.md）→ 期权已结算检查 → 价格 tick 校验 → 增量/累计模式一致性 → 按分配更新 lot、现金、费用、账本与检查点。失败整体回滚，不消耗事件 ID。
 
 5. **撤单（`OwnerExecutor.Cancel`）**
-   持久化 `CancelPending` 与审计 → `Adapter.Cancel` → `Adapter.Query` 取得完整的最终成交快照 → `acknowledge` → `Canceled`。撤单未确认、查询不完整时保持 `CancelPending`，由恢复流程处理。
+   持久化 `CancelPending` 与审计 → `Adapter.Cancel` → `Adapter.Query` 取得完整的最终成交快照 → `acknowledge` → `Canceled`。撤单未确认、查询不完整时保持 `CancelPending`，由恢复流程处理；带 `ExchangeID` 的 `CancelPending` 订单允许再次 `Cancel`（重发场所撤单后仍走权威查询），`Unknown`/`Sending`/无 `ExchangeID` 仍被拒绝。`BanexgAdapter.Cancel` 把统一码 `CodeOrderNotFound`/`CodeOrderNotCancelable`（场所上订单已成交/已撤/已过期）视为「场所状态已终态」，返回 `(true, nil)`，由随后的权威查询落定真实终态（已成交则入账成交）；查询不权威或不完整时仍保持 `CancelPending`。
 
 6. **恢复（`OwnerExecutor.Recover`，`adapter.go`）**
    `Sending` 先转 `Unknown` → 用稳定 client ID 查询 → 权威"不存在"且零成交 → `Rejected`；有成交但历史不完整 → 报错保持冻结；查询结果 `Complete` 后 `acknowledge`。`ApplyTrade`（累计模式）只触发权威查询，避免重复计入。
 
 7. **私有报告循环（`account_service_reports.go:StartReportsContext`）**
-   独立 goroutine，每 5 秒一个节拍：账户已对账且距上次全量快照不足 `privateReconcileInterval`（30 秒）时，节拍只执行 `AdvancePendingExecution`；否则（含账户变动唤醒、订单报告、瞬时故障中）执行全量快照 `RefreshWorkingOrders` → `Reconcile` → `AdvancePendingExecution`（余额、持仓、全部普通/条件挂单）。资金费 `RecoverCash` 不再每节拍拉取：对账返回已结算的现金不符（`ErrReconciliationCashMismatch`）时按需拉取并重试对账一次，其余情况至多每 5 分钟（`fundingRecoveryInterval`）一次，瞬时失败后退避 30 秒；真实不符（如外部划转）仍冻结账户。流事件分三类：外部订单（`RecoverExternalReport`）、账户变动（全量对账）、订单事件（`Recover` 后对账）。
+   实盘与 dry_run 账户（`entry/hub_account.go`）都启动；独立 goroutine，每 5 秒一个节拍：账户已对账且距上次全量快照不足 `privateReconcileInterval`（30 秒）时，节拍只执行 `AdvancePendingExecution`；否则（含账户变动唤醒、订单报告、瞬时故障中）执行全量快照 `RefreshWorkingOrders` → `Reconcile` → `AdvancePendingExecution`（余额、持仓、全部普通/条件挂单）。资金费 `RecoverCash` 不再每节拍拉取：对账返回已结算的现金不符（`ErrReconciliationCashMismatch`）时按需拉取并重试对账一次，其余情况至多每 5 分钟（`fundingRecoveryInterval`）一次，瞬时失败后退避 30 秒；真实不符（如外部划转）仍冻结账户。对账与刚刚刷新的挂单之间场所状态变化（挂单在两步之间成交或撤销）会产生 `ErrReconciliationOrderAbsent`（本地挂单不在权威快照）或 `ErrReconciliationPositionMismatch`；worker 对此重新执行 `RefreshWorkingOrders` + 对账，最多 `reconcileRaceAttempts`（3）次、间隔 `reconcileRacePause`（500ms，可被上下文取消），仍不一致才走冻结。流事件分三类：外部订单（`RecoverExternalReport`）、账户变动（全量对账）、订单事件（`Recover` 后对账）。
    - **瞬时读失败不冻结**：网络失败、超时、限流、临时封禁、场所繁忙、结果不确定、`context.DeadlineExceeded` 与 `ErrAccountQuoteNotVisible`（账户盘口尚不可见或过期）经 `transientAccountReadError` 识别后，本节拍跳过、worker 继续运行，账户在恢复前保持未就绪（新入场以 `account_not_ready` 拒绝）；开始时记 WARN，持续超过 1 分钟记 ERROR（一次），恢复时记 INFO。限流按场所 Retry-After（缺省 30 秒）暂停定时与账户变动触发的对账。
-   - **其余错误仍 fail-closed**：任一步失败经 `FreezeFailure` 持久化风险冻结并上报 `ReportErrors`，每次冻结都记 ERROR `account frozen by the private report worker`（含原因与错误）。其中 `AdvancePendingExecution` 的计划准备被拒时，先按下一节第 8 步的排序与隔离处理；只有这两步都无法消解的错误（未归类错误、提交之后的错误、减仓或未经 owner 准入的入场所致的拒绝）才作为该步失败冻结账户。
+   - **其余错误仍 fail-closed**：任一步失败经 `FreezeFailure` 持久化风险冻结并上报 `ReportErrors`，每次冻结都记 ERROR `account frozen by the private report worker`（含原因与错误）；worker 自身停止期间因取消或释放而中断的步骤不冻结账户。其中 `AdvancePendingExecution` 的计划准备被拒时，先按下一节第 8 步的排序与隔离处理；只有这两步都无法消解的错误（未归类错误、提交之后的错误、减仓或未经 owner 准入的入场所致的拒绝）才作为该步失败冻结账户。
 
 8. **挂单自主推进**
    `pending_registry.go:AdvancePendingExecution`（账户级节拍，不依赖借用者存活）→ `pending_controller.go:AdvancePendingEntries`/`AdvancePendingProtections`（先结算撤单的最终成交，再构建目标）→ `pending_coordination.go:CoordinatePending` → 与策略目标统一经 `Coordinate` 发送。`advancePendingDefinitions`（`pending_registry.go`）在计划被拒时分两层处理，命令准入与自主 tick 共用同一规划器，但只有自主 tick（`commandPlanID == ""`）执行隔离与减仓互让：
    - **OCO 入场组**（`pending_oco.go`）：`resolvePendingOCO` 在 `AdvancePendingProtections` 之后、`CoordinatePending` 之前执行，自主 tick 与命令准入共用（同一 `advancePendingDefinitions`），所以被撤销的同组成员不会成为目标（不触发自成交或风险拒绝）。组按（策略、品种、组名）划分，组名须规范（非空、无首尾空白、≤128 字节、无控制字符），`PendingCreate` 带非法组名被拒；`OCOSeq` 在创建时取账户挂单簿内最大序号加 1，用于按创建先后排序，无组名时必须为 0。仅当某组有至少两个成员且至少一个入场仍开放时才读存储，无 OCO 的计划不受影响。两条规则：(1) 组内任一成员已有成交（lot 持仓非零或 `FilledSteps > 0`）时，其余仍开放的未成交兄弟被撤销，原因 `oco_filled_sibling`；(2) 否则，同一 tick 内入场均「可执行」的成员只保留一个，其余撤销，原因 `oco_simultaneous`。可执行性由 owner 自己评估：在副本上按同一策略与排他性推进入场后再严格评估（挂在场所的限价是委托而非可执行）。保留者取已受保护者（有成交、场所订单、预留或出场）中序号最小者，否则取可执行者中 `OCOSeq` 最小（再按 lot ID）；受保护成员永不被撤销。多个成员都已有成交时全部保留并记 WARN。每个被撤销成员写入检查点 `pending-oco:<lot>`（`Reason`、`Group`、`Instrument`、`Winner`、`AtMS`）及一条 `Rejected` 为该原因的接受事件（`CommandID` 为 `oco-<原因>-<now>`），与计划同一提交；机器人侧 `BridgeTimeSeriesEntryCommand` 把 `EnterReq.OCOGroup` 写入 `PendingCreateSpec.OCOGroup`。
    - **同策略相反增量排序**（`pending_sequence.go`）：只在准备返回 `self_cross` 后触发，已能正常准备的计划不受影响。同一策略的两个 lot 仅在两侧都是退出意图（且 lot 不同）时可内部对冲（`settlement.go:ApplyInternalMatch`，各 lot 仍各自结算）；其余同策略相反意图不能互相对冲（会在冻结中间价上无成交地实现盈亏），因此按每品种每策略处理：减仓（含翻转的减仓部分）的 lot 不被延迟；减仓全部同向时，对侧纯增仓的 lot 被保持（目标重置为已投影数量，约束去除，`Desired` 与入场生命周期不动，下一 tick 重新评估）；无减仓而双向增仓时保留最小 lot ID 所在方向；两侧都是减仓时，仅自主 tick 保留优先级最高的一侧、延迟另一侧本 tick，命令准入下保持拒绝。优先级为该 lot 减仓已被连续延迟的 tick 数（`ReductionHolds`，大者优先），其次最小 lot ID；被延迟的 lot 计数加一，执行后清零，标记只对紧接着的下一个 tick 生效。无饥饿：压过它的 lot 必然至少被延迟过同样次数，会先执行并离开，新冲突的 lot 从 0 起算。
-   - **隔离**（`pending_isolation.go`）：排序之后仍被拒时，仅对确定性、提交前的拒绝（`limit_off_tick`、`risk_limit`、`spot_short`、`venue_minimum`；`self_cross` 不隔离，联合错误不隔离）生效。只允许排除"已被 owner 准入（`CommandRevision > 0`）、仅增加持仓（新入场或加仓）、入场仍开放、无 `ReservedSteps`、无在途场所订单"的 lot；减仓、翻转、已有场所订单或预留的 lot、从未经准入的入场都不可排除。有 `Scope.Lot` 时精确排除该 lot；否则按 `Scope` 的策略与品种缩小候选，取账本顺序中最后一个（老 lot 优先保留）；`venue_minimum` 只在同品种内选择。每次排除后重新准备，最多 8 次（`isolationBudget`），每次准备原子回滚。被排除的入场在与计划同一提交内终止：`Canceled`、`Entry.State=Canceled`、`Desired` 与 `FilledSteps` 置为已持有数量、预留与 `VenueLimit` 清空，并写检查点 `pending-isolated:<lot>`（载荷含 `Code`、`Instrument`、`AtMS`）与 `StrategyAcceptedEvent`（`Kind=EntryIntent`，`CommandID=isolated-<code>-<ms>`，`Rejected=<code>`），随后记告警日志。不能归因、无候选或预算耗尽时返回原错误，沿用失败即冻结。
+   - **隔离**（`pending_isolation.go`）：排序之后仍被拒时，仅对确定性、提交前的拒绝（`limit_off_tick`、`risk_limit`、`spot_short`、`venue_minimum`；`self_cross` 不隔离，联合错误不隔离）生效。只允许排除"已被 owner 准入（`CommandRevision > 0`）、仅增加持仓（新入场或加仓）、入场仍开放、无 `ReservedSteps`、无在途场所订单"的 lot；减仓、翻转、已有场所订单或预留的 lot、从未经准入的入场都不可排除。有 `Scope.Lot` 时精确排除该 lot；否则按 `Scope` 的策略与品种缩小候选，取账本顺序中最后一个（老 lot 优先保留）；`venue_minimum`（仅来自低于 `MinSteps` 或增仓腿低于 `MinNotional`）只在同品种内选择。每次排除后重新准备，最多 8 次（`isolationBudget`），每次准备原子回滚。被排除的入场在与计划同一提交内终止：`Canceled`、`Entry.State=Canceled`、`Desired` 与 `FilledSteps` 置为已持有数量、预留与 `VenueLimit` 清空，并写检查点 `pending-isolated:<lot>`（载荷含 `Code`、`Instrument`、`AtMS`）与 `StrategyAcceptedEvent`（`Kind=EntryIntent`，`CommandID=isolated-<code>-<ms>`，`Rejected=<code>`），随后记告警日志。不能归因、无候选或预算耗尽时返回原错误，沿用失败即冻结。
    - 仅回测使用的 `SharedOrderMgr`（实盘/dry_run 的时序部分一律是 `HubOrderMgr`）不经 owner 准入（`ApplyPendingCommand`）而直接写入挂单账本，其 `PendingDefinition.CommandRevision` 恒为 0，因此其入场不是隔离候选，拒绝仍会冻结。
 
 9. **策略政策**
@@ -215,6 +215,7 @@
 
 12. **模拟盘**
     `paper.go:PaperAdapter.Submit` → `submitLocked`（市价即时成交或按可见价挂单）→ `AdvanceQuote`（仅后续的可见盘口触发挂单）；`NewDurablePaperAdapter` 额外写入账户 SQLite 的操作日志并支持回放。
+    dry_run 的 Hub 账户与生产账户运行同一个私有报告循环（步骤 7）：`PaperAdapter.Reports` 是永不产生事件、随上下文结束而关闭的私有流（模拟成交已由 `Submit` 与 `AdvancePaperQuote` 在同一串行段内经 `Recover` 入账，无需唤醒），`Snapshot` 提供现金、净持仓与挂单的权威快照，`PaperAdapter` 没有 `RecoverCash`（模拟资金费由 `ApplyPaperFunding` 在同一事务内入账）。因此 `RefreshWorkingOrders`、`Reconcile`、`AdvancePendingExecution`、熔断采样与失败即冻结在 dry_run 与实盘一致；回测与因子回放（内存存储、无报告循环）不变。
 
 ## 配置项与外部依赖
 

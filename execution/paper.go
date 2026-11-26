@@ -46,6 +46,7 @@ type PaperAdapter struct {
 	orders              map[string]*paperOrder
 	pending             map[string]*paperOrder // quote scans depend on resting orders, not fill history
 	quotes              map[string]VisibleQuote
+	deferredQuotes      map[string]paperQuoteOperation // durable only: applied to quotes, not yet journaled
 	clients             map[string]string
 	history             *Store
 	optionExpiries      map[string]string
@@ -303,16 +304,36 @@ func (p *paperPosition) applyTrade(side OrderSide, kind IntentKind, steps int64,
 // AdvanceQuote consumes only a subsequent visible top-of-book observation.
 // Returned order IDs must be recovered by their account owner to persist fills.
 func (a *PaperAdapter) advanceQuoteLocked(ctx context.Context, instrument string, q VisibleQuote, nowMS int64) ([]string, error) {
-	if err := ctx.Err(); err != nil {
+	stale, err := a.checkQuoteLocked(ctx, instrument, q, nowMS)
+	if err != nil || stale {
 		return nil, err
 	}
+	a.quotes[instrument] = q
+	ids, prices := a.quoteFillsLocked(instrument, q)
+	if err := a.fillQuoteOrdersLocked(ids, prices, nowMS, q.AtMS); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+// checkQuoteLocked validates a quote and reports whether it is older than the
+// stored one (a no-op). It mutates nothing.
+func (a *PaperAdapter) checkQuoteLocked(ctx context.Context, instrument string, q VisibleQuote, nowMS int64) (stale bool, err error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	if !q.Bid.IsPositive() || q.Ask.LessThan(q.Bid) || q.AtMS < 0 || q.AtMS > q.ReceivedMS || q.ReceivedMS > nowMS || q.ValidUntilMS <= nowMS {
-		return nil, errors.New("execution: passive paper quote is not visible/valid")
+		return false, errors.New("execution: passive paper quote is not visible/valid")
 	}
 	if previous, ok := a.quotes[instrument]; ok && (previous.AtMS > q.AtMS || previous.ReceivedMS > q.ReceivedMS) {
-		return nil, nil
+		return true, nil
 	}
-	a.quotes[instrument] = q
+	return false, nil
+}
+
+// quoteFillsLocked returns the sorted resting orders the quote would fill and
+// their bound prices, without mutating anything.
+func (a *PaperAdapter) quoteFillsLocked(instrument string, q VisibleQuote) ([]string, map[string]decimal.Decimal) {
 	var ids []string
 	prices := make(map[string]decimal.Decimal)
 	for id, order := range a.pending {
@@ -336,16 +357,20 @@ func (a *PaperAdapter) advanceQuoteLocked(ctx context.Context, instrument string
 		}
 	}
 	sort.Strings(ids)
+	return ids, prices
+}
+
+func (a *PaperAdapter) fillQuoteOrdersLocked(ids []string, prices map[string]decimal.Decimal, nowMS, atMS int64) error {
 	for _, id := range ids {
 		order := a.orders[id]
-		receipt, err := a.fillLocked(order.intent, prices[id], nowMS, q.AtMS, true)
+		receipt, err := a.fillLocked(order.intent, prices[id], nowMS, atMS, true)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		order.result.Receipt = receipt
 		delete(a.pending, id)
 	}
-	return ids, nil
+	return nil
 }
 func (a *PaperAdapter) cancelLocked(ctx context.Context, exchangeID string) (bool, error) {
 	if err := ctx.Err(); err != nil {
@@ -449,6 +474,28 @@ func (a *PaperAdapter) Submit(ctx context.Context, order OrderIntent, client str
 func (a *PaperAdapter) AdvanceQuote(ctx context.Context, instrument string, quote VisibleQuote, nowMS int64) ([]string, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.journal != nil {
+		// A quote that fills nothing only updates a.quotes; keep it in memory and
+		// journal the latest one per instrument lazily (see flushDeferredQuotesLocked).
+		if err := a.durableReadyLocked(); err != nil {
+			return nil, err
+		}
+		if _, nested := ctx.Value(storeTxContextKey{}).(scopedStoreTx); nested {
+			return nil, errors.New("execution: durable paper mutation must own its commit boundary")
+		}
+		stale, err := a.checkQuoteLocked(ctx, instrument, quote, nowMS)
+		if err != nil || stale {
+			return nil, err
+		}
+		if ids, _ := a.quoteFillsLocked(instrument, quote); len(ids) == 0 {
+			a.quotes[instrument] = quote
+			if a.deferredQuotes == nil {
+				a.deferredQuotes = map[string]paperQuoteOperation{}
+			}
+			a.deferredQuotes[instrument] = paperQuoteOperation{instrument, quote, nowMS}
+			return nil, nil
+		}
+	}
 	var ids []string
 	err := a.mutatePaperLocked(ctx, paperOperation{Kind: "quote", Quote: &paperQuoteOperation{instrument, quote, nowMS}}, func(ctx context.Context) error {
 		var err error
@@ -468,4 +515,21 @@ func (a *PaperAdapter) Cancel(ctx context.Context, exchangeID string) (bool, err
 		return err
 	})
 	return canceled && err == nil, err
+}
+
+// Reports is the private account stream of the simulated venue. Paper fills are
+// produced by Submit and AdvancePaperQuote and settled through the owner's
+// recovery in the same serialized section, so nothing needs a wake-up: the
+// stream never emits and stays open until ctx ends, then closes, which is the
+// contract the account's private report worker joins on.
+func (a *PaperAdapter) Reports(ctx context.Context) (<-chan BanexgStreamReport, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	stream := make(chan BanexgStreamReport)
+	go func() {
+		<-ctx.Done()
+		close(stream)
+	}()
+	return stream, nil
 }

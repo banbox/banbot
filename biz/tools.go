@@ -1295,7 +1295,8 @@ func (s *ExgOrderSet) Download(startMS, endMS int64, pairs []string, force bool)
 			if err := fetchBatch(false, r[0], r[1]); err != nil {
 				return err
 			}
-			if err := fetchBatch(true, r[0], r[1]); err != nil {
+			// 交易所不提供条件单历史查询时（CodeNotSupport）视为没有条件单，不中断普通订单下载
+			if err := fetchBatch(true, r[0], r[1]); err != nil && err.Code != errs.CodeNotSupport {
 				return err
 			}
 		}

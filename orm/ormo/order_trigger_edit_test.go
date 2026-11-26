@@ -58,3 +58,27 @@ func TestCancelExitTriggerNotifiesSoftwareEditor(t *testing.T) {
 		}
 	}
 }
+
+// An unfilled (Init) order reaches the edit listener only when it is backed by
+// an execution lot; every other unfilled order keeps the original gate.
+func TestEditListenerGateForUnfilledOrders(t *testing.T) {
+	for _, hubBacked := range []bool{true, false} {
+		state := NewOrderState()
+		order := &InOutOrder{IOrder: &IOrder{ID: 1, Status: InOutStatusInit}, Enter: &ExOrder{Enter: true}, Info: map[string]interface{}{}}
+		if hubBacked {
+			order.Info["shared_lot"] = "lot-1"
+		}
+		order.BindState(state)
+		calls := 0
+		state.SetSoftwareEditListener(func(*InOutOrder, string) { calls++ })
+		if err := order.SetEnterLimit(95); err != nil {
+			t.Fatal(err)
+		}
+		if err := order.SetTrailingStop(1, 0); err != nil {
+			t.Fatal(err)
+		}
+		if want := map[bool]int{true: 2, false: 0}[hubBacked]; calls != want {
+			t.Fatalf("hub-backed=%v: %d edit notifications, want %d", hubBacked, calls, want)
+		}
+	}
+}

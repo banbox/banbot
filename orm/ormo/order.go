@@ -44,6 +44,7 @@ type InOutOrder struct {
 	DirtyInfo  bool                   `json:"-"` // Info has unsaved temporary changes 有未保存的临时修改
 	idKey      string                 // Key to distinguish orders 区分订单的key
 	state      *OrderState            `json:"-"`
+	infoHook   func(*InOutOrder, string, interface{})
 }
 
 // BindState associates an order with the runtime-owned order registries. It
@@ -142,6 +143,16 @@ func (i *InOutOrder) SetInfo(key string, val interface{}) {
 		i.Info[key] = val
 	}
 	i.DirtyInfo = true
+	if i.infoHook != nil {
+		i.infoHook(i, key, val)
+	}
+}
+
+// SetInfoHook registers an observer of SetInfo (val == nil means deleted). It is
+// copied by Clone. Execution-backed order views use it to keep strategy-written
+// keys across view rebuilds; plain orders never set it.
+func (i *InOutOrder) SetInfoHook(hook func(od *InOutOrder, key string, val interface{})) {
+	i.infoHook = hook
 }
 
 func (i *InOutOrder) loadInfo() {
@@ -1172,7 +1183,13 @@ func fireOdEdit(od *InOutOrder, action string) {
 		listener = OdEditListener
 		envReal = core.EnvReal
 	}
-	if listener != nil && envReal && od.Status > InOutStatusInit && od.ID > 0 {
+	if listener == nil || !envReal || od == nil || od.ID <= 0 {
+		return
+	}
+	// An execution-backed (Hub) order carries its lot and is edited while it is
+	// still unfilled (Init): the owner holds the resting entry, so the edit must
+	// reach it. Every other order is forwarded only once it has been entered.
+	if _, hubLot := od.Info["shared_lot"].(string); od.Status > InOutStatusInit || hubLot {
 		listener(od, action)
 	}
 }
@@ -1279,6 +1296,7 @@ func (i *InOutOrder) Clone() *InOutOrder {
 		DirtyInfo:  i.DirtyInfo,
 		idKey:      i.idKey,
 		state:      i.state,
+		infoHook:   i.infoHook,
 	}
 	for k, v := range i.Info {
 		clone.Info[k] = cloneOrderInfoVal(v)

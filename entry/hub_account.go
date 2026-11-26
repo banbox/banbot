@@ -226,10 +226,9 @@ func newHubAccountFactory(root, leaseDir string, netDisabled bool) execution.Hub
 		market, err = execution.StartBanexgMarketStream(ctx, account, exchange, c.Instruments, 5*time.Second, func(account *execution.SharedAccountBorrow) error {
 			return account.ValidateAccountBindings(strategies)
 		}, func(account *execution.SharedAccountBorrow) error {
-			if request.Env == core.RunEnvProd {
-				return account.StartReportsContext(ctx)
-			}
-			return nil
+			// dry_run runs the same worker against the paper venue so owner
+			// maintenance and fail-closed freezing match live.
+			return account.StartReportsContext(ctx)
 		})
 		if err != nil {
 			return binding, err

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/banbox/banexg"
+	"github.com/banbox/banexg/errs"
 	"github.com/shopspring/decimal"
 )
 
@@ -298,6 +299,11 @@ func (a *BanexgAdapter) Submit(ctx context.Context, intent OrderIntent, clientID
 		return sdkErr
 	})
 	if err != nil {
+		if definiteSubmitRefusal(ctx, err) {
+			// The venue answered about this request and created nothing: a
+			// zero-fill rejection without venue identity, not an unknown outcome.
+			return SubmitReceipt{Rejected: true}, nil
+		}
 		return SubmitReceipt{}, err
 	}
 	if raw == nil || !canonicalID(raw.ID) || raw.ClientOrderID != clientID {
@@ -306,6 +312,31 @@ func (a *BanexgAdapter) Submit(ctx context.Context, intent OrderIntent, clientID
 	// Creation acknowledgements often omit authoritative cumulative fees. They
 	// establish only identity; all fills come from a subsequent complete query.
 	return SubmitReceipt{ExchangeID: raw.ID, Rejected: raw.Status == banexg.OdStatusRejected}, nil
+}
+
+// definiteSubmitRefusal reports whether a CreateOrder error proves the venue
+// explicitly refused the request and created no order. Only unified codes that
+// banexg derives exclusively from a venue error response about the request
+// itself qualify (binance/okx/bybit mappings). Timeouts, network, cancellation,
+// rate limits, server errors, CodeExecutionUnknown, CodeDuplicateRequest (the
+// order may exist), CodeParamInvalid (also raised locally) and unclassified
+// CodeExchangeError stay uncertain. A cancelled/expired caller context never
+// qualifies, as the response may have been lost.
+func definiteSubmitRefusal(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() != nil {
+		return false
+	}
+	var sdk *errs.Error
+	if !errors.As(err, &sdk) {
+		return false
+	}
+	switch sdk.Code {
+	case errs.CodeOrderRejected, errs.CodeInsufficientFunds, errs.CodeInsufficientMargin,
+		errs.CodeReduceOnlyRejected, errs.CodePrecisionViolation, errs.CodeRiskLimit,
+		errs.CodeOrderWouldTrigger:
+		return true
+	}
+	return false
 }
 
 func (a *BanexgAdapter) storedIdentity(ctx context.Context, clientID, exchangeID string) (StoredOrder, error) {
@@ -359,6 +390,12 @@ func (a *BanexgAdapter) Cancel(ctx context.Context, exchangeID string) (bool, er
 		return nil
 	})
 	if err != nil {
+		// The venue reports the order unknown or final (filled, cancelled,
+		// expired): its state is settled by the caller's authoritative query.
+		var sdk *errs.Error
+		if ctx.Err() == nil && errors.As(err, &sdk) && (sdk.Code == errs.CodeOrderNotFound || sdk.Code == errs.CodeOrderNotCancelable) {
+			return true, nil
+		}
 		return false, err
 	}
 	if raw == nil || raw.ID != exchangeID {

@@ -433,3 +433,172 @@ func TestDurablePaperUnavailableCommitProofFailsClosed(t *testing.T) {
 		t.Fatal("failed commit changed cash")
 	}
 }
+
+func paperHead(p *PaperAdapter) int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.journal.head.Sequence
+}
+
+func paperTestQuote(bid, ask string, at int64) VisibleQuote {
+	return VisibleQuote{Bid: intentPrice(bid), Ask: intentPrice(ask), AtMS: at, ReceivedMS: at, ValidUntilMS: 1000}
+}
+
+func assertPaperQuotesEqual(t *testing.T, a, b *PaperAdapter) {
+	t.Helper()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	qa, _ := json.Marshal(a.quotes)
+	qb, _ := json.Marshal(b.quotes)
+	pa, _ := json.Marshal(a.positions)
+	pb, _ := json.Marshal(b.positions)
+	if string(qa) != string(qb) || !a.cash.Equal(b.cash) || string(pa) != string(pb) || len(a.orders) != len(b.orders) || len(a.pending) != len(b.pending) {
+		t.Fatal("replayed paper state differs")
+	}
+}
+
+func TestDurablePaperNonFillingQuotesAreDeferredAndFlushedBeforeNextOperation(t *testing.T) {
+	ctx := context.Background()
+	s, _, _, _ := testStore(t)
+	p := durablePaper(t, s)
+	before := paperHead(p)
+	for i := int64(0); i < 20; i++ {
+		for _, id := range []string{"BTC", "ETH", "SOL"} {
+			if ids, err := p.AdvanceQuote(ctx, id, paperTestQuote("99", "100", 10+i), 10+i); err != nil || len(ids) != 0 {
+				t.Fatal(ids, err)
+			}
+		}
+	}
+	// Stale quote: no effect, no record.
+	if _, err := p.AdvanceQuote(ctx, "BTC", paperTestQuote("1", "2", 5), 30); err != nil {
+		t.Fatal(err)
+	}
+	if paperHead(p) != before {
+		t.Fatal("non-filling quotes were journaled")
+	}
+	// Latest deferred BTC quote (ask 97) must reject this post-only buy.
+	if _, err := p.AdvanceQuote(ctx, "BTC", paperTestQuote("96", "97", 40), 40); err != nil {
+		t.Fatal(err)
+	}
+	post := durablePaperOrder("post")
+	post.Limit = intentPrice("98")
+	post.PostOnly = true
+	post.SubmitAtMS = 41
+	receipt, err := p.Submit(ctx, post, "post-client")
+	if err != nil || !receipt.Rejected {
+		t.Fatal(receipt, err)
+	}
+	if paperHead(p) != before+2 {
+		t.Fatalf("want flush+submit, head %d -> %d", before, paperHead(p))
+	}
+	resting := durablePaperOrder("rest")
+	resting.Limit = intentPrice("95")
+	resting.PostOnly = true
+	resting.SubmitAtMS = 42
+	if r, err := p.Submit(ctx, resting, "rest-client"); err != nil || r.Rejected {
+		t.Fatal(r, err)
+	}
+	if paperHead(p) != before+3 {
+		t.Fatal("submit without deferred quotes must journal exactly one operation")
+	}
+	restored := durablePaper(t, s)
+	assertPaperReplay(t, p, restored)
+	assertPaperQuotesEqual(t, p, restored)
+	if len(restored.quotes) != 3 || restored.quotes["BTC"].AtMS != 40 {
+		t.Fatal("replay lost latest quotes", restored.quotes)
+	}
+}
+
+func TestDurablePaperFillingQuoteFlushesOtherInstrumentsFirst(t *testing.T) {
+	ctx := context.Background()
+	s, _, _, _ := testStore(t)
+	p := durablePaper(t, s)
+	order := durablePaperOrder("rest")
+	order.Limit = intentPrice("98")
+	if _, err := p.Submit(ctx, order, "rest"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.AdvanceQuote(ctx, "ETH", paperTestQuote("50", "51", 12), 12); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.AdvanceQuote(ctx, "BTC", paperTestQuote("99", "100", 12), 12); err != nil {
+		t.Fatal(err)
+	}
+	head := paperHead(p)
+	ids, err := p.AdvanceQuote(ctx, "BTC", paperTestQuote("97", "98", 13), 13)
+	if err != nil || len(ids) != 1 || p.Metrics().Fills != 1 {
+		t.Fatal(ids, err)
+	}
+	if paperHead(p) != head+2 {
+		t.Fatal("filling quote must journal flush + quote")
+	}
+	restored := durablePaper(t, s)
+	assertPaperReplay(t, p, restored)
+	assertPaperQuotesEqual(t, p, restored)
+	if restored.Metrics().Fills != 1 || restored.quotes["ETH"].AtMS != 12 {
+		t.Fatal("replay lost fill or flushed quote")
+	}
+}
+
+func TestDurablePaperReplaysLegacyPerQuoteJournal(t *testing.T) {
+	ctx := context.Background()
+	s, _, _, _ := testStore(t)
+	p := durablePaper(t, s)
+	order := durablePaperOrder("rest")
+	order.Limit = intentPrice("98")
+	if _, err := p.Submit(ctx, order, "rest"); err != nil {
+		t.Fatal(err)
+	}
+	legacy := func(instrument string, q VisibleQuote, now int64) {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		err := p.mutatePaperLocked(ctx, paperOperation{Kind: "quote", Quote: &paperQuoteOperation{instrument, q, now}}, func(ctx context.Context) error {
+			_, err := p.advanceQuoteLocked(ctx, instrument, q, now)
+			return err
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	head := paperHead(p)
+	legacy("BTC", paperTestQuote("99", "100", 12), 12)
+	legacy("BTC", paperTestQuote("99", "100", 12), 12)
+	legacy("BTC", paperTestQuote("97", "98", 13), 13)
+	if paperHead(p) != head+3 || p.Metrics().Fills != 1 {
+		t.Fatal("legacy journal not written")
+	}
+	restored := durablePaper(t, s)
+	assertPaperReplay(t, p, restored)
+	assertPaperQuotesEqual(t, p, restored)
+}
+
+func TestDurablePaperFailedFlushKeepsQuotesDeferred(t *testing.T) {
+	ctx := context.Background()
+	s, _, _, _ := testStore(t)
+	p := durablePaper(t, s)
+	if _, err := p.AdvanceQuote(ctx, "BTC", paperTestQuote("99", "100", 12), 12); err != nil {
+		t.Fatal(err)
+	}
+	head := paperHead(p)
+	rejectPaperJournal(t, s)
+	if _, err := p.Submit(ctx, durablePaperOrder("x"), "x"); err == nil {
+		t.Fatal("failed flush acknowledged submit")
+	}
+	if paperHead(p) != head || len(p.orders) != 0 || len(p.deferredQuotes) != 1 || p.quotes["BTC"].AtMS != 12 || p.journal.failure != nil {
+		t.Fatal("failed flush left inconsistent state")
+	}
+	if _, err := s.db.Exec("DROP TRIGGER reject_paper_journal"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Submit(ctx, durablePaperOrder("x"), "x"); err != nil {
+		t.Fatal(err)
+	}
+	if paperHead(p) != head+2 || len(p.deferredQuotes) != 0 {
+		t.Fatal("deferred quotes not flushed after recovery")
+	}
+	restored := durablePaper(t, s)
+	assertPaperReplay(t, p, restored)
+	assertPaperQuotesEqual(t, p, restored)
+}

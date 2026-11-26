@@ -8,7 +8,7 @@ toolchain go1.26.8
 
 require (
 	github.com/anyongjin/go-bayesopt v1.0.2
-	github.com/banbox/banexg v0.2.68
+	github.com/banbox/banexg v0.2.69
 	github.com/banbox/banta v0.5.0
 	github.com/c-bata/goptuna v0.9.0
 	github.com/cloudwego/eino v0.9.22

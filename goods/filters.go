@@ -420,6 +420,10 @@ func filterByMinCostWithRuntime(exchange banexg.BanExchange, symbols []*SymbolVo
 		}
 		minAmt := mar.Limits.Amount.Min
 		minCost := minAmt * item.Price
+		// 部分市场只给出最小名义价值（Amount.Min 为 0），取两者较大者
+		if mar.Limits.Cost != nil && mar.Limits.Cost.Min > minCost {
+			minCost = mar.Limits.Cost.Min
+		}
 		if accCost < minCost {
 			skip[item.Symbol] = minCost
 		} else {

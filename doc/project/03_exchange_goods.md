@@ -162,7 +162,7 @@
 
 ### 10. 最小下单额过滤
 
-`filterByMinCostWithRuntime`（`goods/filters.go:filterByMinCostWithRuntime`，经 `orm/exsymbol.go:LookupExchangeMarketForConfig` 解析多市场元数据）：取所有非 NoTrade 账户的 `stakeAmount` 最大值（若为 0 则用 default 账户的 stake），对每个标的 `minCost = Limits.Amount.Min * Price`，超过则跳过并记录。无市场或无 `Limits.Amount` 的标的同样不进入结果（`AllowRetiredPairs` 时库内有窗口内数据的由 `goods/biz.go:keepRetiredStaticPairs` 放回）。
+`filterByMinCostWithRuntime`（`goods/filters.go:filterByMinCostWithRuntime`，经 `orm/exsymbol.go:LookupExchangeMarketForConfig` 解析多市场元数据）：取所有非 NoTrade 账户的 `stakeAmount` 最大值（若为 0 则用 default 账户的 stake），对每个标的 `minCost = max(Limits.Amount.Min * Price, Limits.Cost.Min)`（部分市场只给出最小名义价值，`Amount.Min` 为 0），超过则跳过并记录。无市场或无 `Limits.Amount` 的标的同样不进入结果（`AllowRetiredPairs` 时库内有窗口内数据的由 `goods/biz.go:keepRetiredStaticPairs` 放回）。
 
 ## 配置项与外部依赖
 
@@ -243,5 +243,5 @@
 - `exg` 的名字空间方法依赖 `Default` 已由启动流程初始化。
 - banexg v0.2.66 未实现归档 URL 与账户导出，`BuildArchiveURLForExchange` 恒返回 `CodeNotSupport`，除非预设 `WsSymbol.ArchiveURL`。
 - banexg 的 `china` 适配器行情/下单/查询接口均标记为不支持，实盘不可用；`doc/cn_markets` 描述的 CTP、主力连续合约（888/88）与拼接复权在仓库中没有实现。
-- 最小下单额按 `Limits.Amount.Min * Price` 计算，单位语义取决于 banexg 对 `Limits.Amount` 的归一化。
+- 最小下单额按 `Limits.Amount.Min * Price` 与 `Limits.Cost.Min` 的较大者计算，单位语义取决于 banexg 对 `Limits.Amount` 的归一化。
 - `config` 查询符号规则时每次新建并关闭一个交易所实例，仅在配置解析阶段调用。

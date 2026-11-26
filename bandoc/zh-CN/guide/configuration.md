@@ -307,6 +307,8 @@ llm_models:  # LLM 模型配置，键为模型名；需由策略项目或工具�
 
 默认 Hub 实时路径把 `leverage`（账户级优先于根级，须为 1–125 的整数）作为该账户全部品种的固定杠杆：随账户注册声明，由 Hub 账户 owner 上线时逐品种设置到交易所，设置失败则账户不上线。它只决定交易所侧的保证金倍数，不放大下单名义金额；要求 `execution.margin_rate >= 1/leverage`。策略请求里的逐单 `Leverage` 仍被拒绝。杠杆是账户注册内容的一部分，变更需按账户配置变更流程处理。内嵌 execution provider 不支持声明杠杆。
 
+`max_open_orders`、`max_simul_open` 及策略 `max_open` / `max_simul_open` 修改后重启即生效：Hub 路径采用配置值覆盖机器人日志中保存的旧限额，并记一条告警（旧值→新值）。dry_run 与 prod 一样拒绝逐单 `Leverage`。
+
 #### 默认 Hub 实时路径上不生效的配置
 默认的 prod/dry-run 路径（共享账户与 Hub）不运行旧的钱包与选币轮动机制。下列键可以保留但不起作用；启动时对值被改动过的键各记一条告警（零值和默认值不报告）：
 

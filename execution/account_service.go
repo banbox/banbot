@@ -279,7 +279,7 @@ func (b *SharedAccountBorrow) Reconcile(id string, nowMS int64) error {
 			}
 			for exID := range known {
 				if !seen[exID] {
-					return fmt.Errorf("execution: local open order %s absent from authoritative snapshot; recover first", exID)
+					return fmt.Errorf("%w: order %s", ErrReconciliationOrderAbsent, exID)
 				}
 			}
 			cash, err := decimal.NewFromString(venue.Cash)

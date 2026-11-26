@@ -176,8 +176,45 @@ func TestSequenceOppositeReductionsRule(t *testing.T) {
 }
 
 // Only a reduction can trip the refusal: nothing is excludable, so the tick
-// still fails exactly as before and nothing is written.
+// still fails exactly as before and nothing is written. The refusal is the
+// minimum quantity, which applies to reductions (the minimum notional does not):
+// a long's take-profit and another strategy's short stop fire together and net
+// to a 4-step reduce-only sell, below the 5-step minimum.
 func TestIsolationNeverExcludesReduction(t *testing.T) {
+	eachStore(t, func(t *testing.T, memory bool) {
+		f := newSequenceFixture(t, memory)
+		market := f.b.service.markets["BTC"]
+		market.instrument.MinSteps = 5
+		f.b.service.markets["BTC"] = market
+		f.createProtected(t, "a", "lot-1", Buy, TakeProfitProtection, "110", 12)
+		short := PendingCommand{ID: "lot-2", Strategy: "b", Lot: "lot-2", Action: PendingCreate,
+			Create: &PendingCreateSpec{Instrument: "BTC", Side: Sell, QuantitySteps: 6, Protections: []PositionProtection{{Kind: StopLossProtection, Level: intentPrice("110")}}}}
+		if _, err := f.b.ApplyPendingCommand(context.Background(), short, 13); err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]int64{"a/lot-1": 10, "b/lot-2": -6}
+		if got := f.lots(t); !reflect.DeepEqual(got, want) {
+			t.Fatal("setup", got)
+		}
+		*f.price = "110"
+		err := f.b.AdvancePendingExecution(context.Background(), 14)
+		if !errors.Is(err, ErrVenueMinimum) {
+			t.Fatal("reduction refusal must still fail the tick", err)
+		}
+		if got := f.lots(t); !reflect.DeepEqual(got, want) {
+			t.Fatal("reduction state changed", got)
+		}
+		for _, id := range []string{"lot-1", "lot-2"} {
+			if d := f.book(t, id); d.Order.Canceled {
+				t.Fatal("durable book changed", id)
+			}
+		}
+	})
+}
+
+// A stop whose closing sell is worth less than the minimum notional is a
+// reduce-only exit: it is prepared and sent, the venue is the judge.
+func TestReduceOnlyStopBelowMinNotionalExecutes(t *testing.T) {
 	eachStore(t, func(t *testing.T, memory bool) {
 		f := newSequenceFixture(t, memory)
 		market := f.b.service.markets["BTC"]
@@ -187,21 +224,59 @@ func TestIsolationNeverExcludesReduction(t *testing.T) {
 		if got := f.lots(t); !reflect.DeepEqual(got, map[string]int64{"a/lot-1": 10}) {
 			t.Fatal("setup", got)
 		}
-		*f.price = "90" // the stop sells 1 BTC worth 90 < 95
-		err := f.b.AdvancePendingExecution(context.Background(), 14)
-		if !errors.Is(err, ErrVenueMinimum) {
-			t.Fatal("reduction refusal must still fail the tick", err)
+		fills := f.venue.Metrics().Fills
+		f.tick(t, "90", 14) // 1 BTC worth 90 < 95
+		if got := f.lots(t); len(got) != 0 {
+			t.Fatal("stop below the minimum notional did not close", got)
 		}
-		if got := f.lots(t); !reflect.DeepEqual(got, map[string]int64{"a/lot-1": 10}) {
-			t.Fatal("reduction state changed", got)
+		if f.venue.Metrics().Fills == fills {
+			t.Fatal("exit never reached the venue")
 		}
-		if _, err := f.b.service.store.StrategyCheckpoint(context.Background(), "a", "pending-isolated:lot-1"); err == nil {
-			t.Fatal("a reduction was isolated")
-		}
-		if d := f.book(t, "lot-1"); d.Order.Canceled {
-			t.Fatal("durable book changed")
-		}
+		requireNotFrozen(t, f)
 	})
+}
+
+// PrepareOrder keeps the minimum quantity for every order and the minimum
+// notional for every order that is not reduce-only.
+func TestPrepareOrderMinimums(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		reduceOnly bool
+		steps      int64
+		minSteps   int64
+		ok         bool
+	}{
+		{"increasing below notional refused", false, 5, 0, false}, // 0.5 BTC at 100 = 50 < 100
+		{"reduce-only below notional prepared", true, 5, 0, true},
+		{"reduce-only below min steps refused", true, 5, 6, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, _, _ := testStore(t)
+			instrument := ledgerInstrument()
+			instrument.MinNotional = intentPrice("100")
+			instrument.MinSteps = tc.minSteps
+			kind := EntryIntent
+			if tc.reduceOnly {
+				kind = ExitIntent
+			}
+			plan := Plan{ID: "plan-min", Sequence: 1, DecisionMS: 10, ExpiresMS: 1000}
+			intent := EligibleIntent{ID: "min-a", Account: s.key, Strategy: "a", Lot: "lot-a", Instrument: "BTC", Kind: kind, Side: Sell, QuantitySteps: tc.steps, State: Eligible, Conditions: IntentConditions{CreatedBar: 5}}
+			plan.Intents = append(plan.Intents, intent)
+			order := OrderIntent{ID: "min", PlanID: plan.ID, Instrument: instrument, Side: Sell, Steps: tc.steps, ReduceOnly: tc.reduceOnly,
+				Observation: ExecutionObservation{Price: intentPrice("100"), AtMS: 10, ValidUntilMS: 1000, Bar: 5},
+				Allocations: []FillAllocation{{ID: "a", IntentID: intent.ID, Strategy: "a", Lot: "lot-a", Side: Sell, Kind: kind, Steps: tc.steps}}}
+			if err := s.SavePlan(context.Background(), plan); err != nil {
+				t.Fatal(err)
+			}
+			err := s.PrepareOrder(context.Background(), order, 10)
+			if tc.ok && err != nil {
+				t.Fatal("must be prepared", err)
+			}
+			if !tc.ok && err == nil {
+				t.Fatal("must be refused")
+			}
+		})
+	}
 }
 
 func isolationUnit() (AccountSnapshot, []PendingDefinition, []InstrumentRebalance) {

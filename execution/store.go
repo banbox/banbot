@@ -347,7 +347,7 @@ func (s *Store) PrepareOrder(ctx context.Context, order OrderIntent, nowMS int64
 	if !canonicalID(order.ID) || !canonicalID(order.PlanID) || order.Steps <= 0 || (order.Side != Buy && order.Side != Sell) || order.Limit.IsNegative() || order.PostOnly && !order.Limit.IsPositive() || nowMS < 0 {
 		return errors.New("execution: invalid real order")
 	}
-	if order.Steps < order.Instrument.MinSteps || order.Instrument.Notional(order.Steps, order.Observation.Price).LessThan(order.Instrument.MinNotional) {
+	if order.Steps < order.Instrument.MinSteps || !order.ReduceOnly && order.Instrument.Notional(order.Steps, order.Observation.Price).LessThan(order.Instrument.MinNotional) {
 		return errors.New("execution: order below instrument minimum units/notional")
 	}
 	var sum int64

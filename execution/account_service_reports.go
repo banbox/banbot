@@ -14,6 +14,21 @@ import (
 
 const privateReportJoinTimeout = 15 * time.Second
 
+// reconcileRaceAttempts bounds refresh+reconcile runs per tick when the venue
+// state moved between the two steps; reconcileRacePause separates them.
+const reconcileRaceAttempts = 3
+
+var reconcileRacePause = 500 * time.Millisecond
+
+// privateReportTick is the worker's tick period; tests shorten it.
+var privateReportTick = 5 * time.Second
+
+// reconcileRaceError excludes the cash mismatch, which settleAndReconcile
+// already retries after an on-demand funding fetch.
+func reconcileRaceError(err error) bool {
+	return errors.Is(err, ErrReconciliationOrderAbsent) || errors.Is(err, ErrReconciliationPositionMismatch)
+}
+
 // Serialize checkpoint capture and commit under the service's exclusive store
 // lease. Each committed failure advances the durable checkpoint; a later
 // service lifecycle therefore cannot reuse an earlier immutable event ID.
@@ -150,11 +165,17 @@ func (b *SharedAccountBorrow) StartReportsContext(callerCtx context.Context) err
 		s.reportErrors = make(chan error, 1)
 		service := s
 		done := s.reportDone
+		tick := privateReportTick
 		go func() {
 			defer close(done)
 			borrow := service.Borrow()
 			defer borrow.Release()
 			fail := func(id string, cause error, now int64) {
+				// A step interrupted by this worker's own shutdown says nothing about
+				// the ledger; do not turn a stop into a persisted freeze.
+				if ctx.Err() != nil && (errors.Is(cause, context.Canceled) || errors.Is(cause, ErrReleased) || errors.Is(cause, ErrOwnerStopped)) {
+					return
+				}
 				// The cause otherwise only reaches reportErrors, which nobody may read.
 				log.Error("account frozen by the private report worker", zap.String("reason", id), zap.Error(cause))
 				freezeErr := borrow.FreezeFailure(id, now)
@@ -163,7 +184,7 @@ func (b *SharedAccountBorrow) StartReportsContext(callerCtx context.Context) err
 				default:
 				}
 			}
-			ticker := time.NewTicker(5 * time.Second)
+			ticker := time.NewTicker(tick)
 			defer ticker.Stop()
 			var lastFundingMS, lastReconcileMS int64
 			var outage transientOutage
@@ -228,6 +249,26 @@ func (b *SharedAccountBorrow) StartReportsContext(callerCtx context.Context) err
 					return false
 				}
 				skipped, err := settleAndReconcile(reason + "-reconcile")
+				// A resting order that filled or was cancelled between the refresh
+				// above and the venue snapshot disagrees once; refresh again so the
+				// fill is processed before any freeze. Persistent disagreement still
+				// freezes after the bounded retries.
+				for attempt := 1; attempt < reconcileRaceAttempts && err != nil && reconcileRaceError(err); attempt++ {
+					select {
+					case <-ctx.Done():
+						attempt = reconcileRaceAttempts
+						continue
+					case <-time.After(reconcileRacePause):
+					}
+					if rerr := borrow.RefreshWorkingOrders(ctx, time.Now().UnixMilli()); rerr != nil {
+						if outage.transient(reason+"-recovery", rerr) {
+							return true
+						}
+						fail(reason+"-recovery", rerr, time.Now().UnixMilli())
+						return false
+					}
+					skipped, err = settleAndReconcile(reason + "-reconcile")
+				}
 				if err != nil {
 					fail(reason+"-reconcile", err, time.Now().UnixMilli())
 					return false

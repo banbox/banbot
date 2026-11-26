@@ -2,12 +2,14 @@ package biz
 
 import (
 	"errors"
+	"maps"
 
 	"github.com/banbox/banbot/config"
 	"github.com/banbox/banbot/execution"
 	"github.com/banbox/banbot/orm"
 	"github.com/banbox/banbot/strat"
 	"github.com/banbox/banexg/utils"
+	"go.uber.org/zap"
 )
 
 // timeSeriesJobPolicies returns the run policies of the jobs bound to one
@@ -28,7 +30,21 @@ func timeSeriesJobPolicies(jobs map[sharedJobIdentity]*strat.StratJob, symbol, t
 // known lots and the admission counters of the current bar round; an accepted
 // request updates state.Admission, which the caller persists with the request.
 // jobPolicies are the policies of the bound jobs for this symbol and timeframe.
+// The limits saved in state must equal the configured ones (replay determinism
+// of the backtest manager); a change is an error.
 func admitTimeSeriesEntry(deps RuntimeDeps, jobPolicies map[string]*config.RunPolicyConfig, state *sharedTSCheckpoint, snapshot execution.AccountSnapshot, exs *orm.ExSymbol, tf string, req *strat.EnterReq) (bool, error) {
+	return admitTimeSeriesEntryMode(deps, jobPolicies, state, snapshot, exs, tf, req, false)
+}
+
+// admitTimeSeriesEntryAdopting is admitTimeSeriesEntry for the live/dry_run Hub
+// path: a configured limit that differs from the saved one replaces it (WARN
+// once the new limits are persisted), because the Hub manager pushes the
+// configured limits to the owner at start and nothing else could update them.
+func admitTimeSeriesEntryAdopting(deps RuntimeDeps, jobPolicies map[string]*config.RunPolicyConfig, state *sharedTSCheckpoint, snapshot execution.AccountSnapshot, exs *orm.ExSymbol, tf string, req *strat.EnterReq) (bool, error) {
+	return admitTimeSeriesEntryMode(deps, jobPolicies, state, snapshot, exs, tf, req, true)
+}
+
+func admitTimeSeriesEntryMode(deps RuntimeDeps, jobPolicies map[string]*config.RunPolicyConfig, state *sharedTSCheckpoint, snapshot execution.AccountSnapshot, exs *orm.ExSymbol, tf string, req *strat.EnterReq, adopt bool) (bool, error) {
 	// Admission state is staged with the request checkpoint and serialized by
 	// the account owner. Rejected or failed requests do not spend bar capacity.
 	counts := make(map[string]int)
@@ -56,12 +72,18 @@ func admitTimeSeriesEntry(deps RuntimeDeps, jobPolicies map[string]*config.RunPo
 		policies[name] = policy
 	}
 	previous := state.Admission
-	gate := OrderMgr{Account: deps.DefaultAccount, clock: deps.Clock, runtimeCore: deps.Core, runtimeDeps: true, walletDeps: deps, runtimeCfg: makeRuntimeOrderConfig(deps, deps.DefaultAccount), BarMS: previous.BarMS, simulOpen: previous.SimulOpen, simulOpenSt: previous.Strategies}
+	gate := OrderMgr{Account: deps.DefaultAccount, clock: deps.Clock, runtimeCore: deps.Core, runtimeDeps: true, walletDeps: deps, runtimeCfg: makeRuntimeOrderConfig(deps, deps.DefaultAccount), BarMS: previous.BarMS, simulOpen: previous.SimulOpen, simulOpenSt: maps.Clone(previous.Strategies)}
 	limits := sharedEntryLimits{MaxOpen: gate.maxOpenOrders(), MaxSimul: gate.maxSimulOpen()}
 	if previous.AccountLimits != nil && *previous.AccountLimits != limits {
-		return false, errors.New("biz: shared account TS admission limits changed; explicit policy update required")
+		if !adopt {
+			return false, errors.New("biz: shared account TS admission limits changed; explicit policy update required")
+		}
+		deps.Logger().Warn("account admission limits changed; adopting the configured limits",
+			zap.Int("old_max_open", previous.AccountLimits.MaxOpen), zap.Int("old_max_simul", previous.AccountLimits.MaxSimul),
+			zap.Int("new_max_open", limits.MaxOpen), zap.Int("new_max_simul", limits.MaxSimul))
 	}
-	policyLimits := previous.PolicyLimits
+	// Cloned: a rejected entry must leave the journal's maps untouched.
+	policyLimits := maps.Clone(previous.PolicyLimits)
 	if policyLimits == nil {
 		policyLimits = make(map[string]sharedEntryLimits)
 	}
@@ -73,7 +95,14 @@ func admitTimeSeriesEntry(deps RuntimeDeps, jobPolicies map[string]*config.RunPo
 	}
 	if saved, exists := policyLimits[req.StratName]; exists {
 		if declared != nil && saved != (sharedEntryLimits{MaxOpen: declared.MaxOpen, MaxSimul: declared.MaxSimulOpen}) {
-			return false, errors.New("biz: shared strategy TS admission limits changed; explicit policy update required")
+			if !adopt {
+				return false, errors.New("biz: shared strategy TS admission limits changed; explicit policy update required")
+			}
+			deps.Logger().Warn("strategy admission limits changed; adopting the configured limits", zap.String("strategy", req.StratName),
+				zap.Int("old_max_open", saved.MaxOpen), zap.Int("old_max_simul", saved.MaxSimul),
+				zap.Int("new_max_open", declared.MaxOpen), zap.Int("new_max_simul", declared.MaxSimulOpen))
+			saved = sharedEntryLimits{MaxOpen: declared.MaxOpen, MaxSimul: declared.MaxSimulOpen}
+			policyLimits[req.StratName] = saved
 		}
 		policies[req.StratName] = &config.RunPolicyConfig{MaxOpen: saved.MaxOpen, MaxSimulOpen: saved.MaxSimul}
 	} else if declared != nil {

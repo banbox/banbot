@@ -432,7 +432,9 @@ func (e *OwnerExecutor) Cancel(id string, nowMS int64) error {
 			if order.State == OrderFilled || order.State == OrderCanceled || order.State == OrderRejected {
 				return nil
 			}
-			if order.State == OrderUnknown || order.State == OrderSending || order.State == OrderCancelPending || order.ExchangeID == "" {
+			// CancelPending with a venue identity is a retry: an earlier cancel was
+			// not confirmed and Recover keeps a still-open order in that state.
+			if order.State == OrderUnknown || order.State == OrderSending || order.ExchangeID == "" {
 				return errors.New("execution: query uncertain order before cancellation")
 			}
 			order.Attempt++

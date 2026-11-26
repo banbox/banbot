@@ -44,9 +44,12 @@ type paperQuoteOperation struct {
 	NowMS      int64
 }
 type paperOperation struct {
-	Kind     string
-	Submit   *paperSubmitOperation `json:",omitempty"`
-	Quote    *paperQuoteOperation  `json:",omitempty"`
+	Kind   string
+	Submit *paperSubmitOperation `json:",omitempty"`
+	Quote  *paperQuoteOperation  `json:",omitempty"`
+	// Quotes is a batch of non-filling quotes (latest per instrument, sorted by
+	// instrument id) journaled as one operation of kind "quotes".
+	Quotes   []paperQuoteOperation `json:",omitempty"`
 	Cancel   string                `json:",omitempty"`
 	Cash     *decimal.Decimal      `json:",omitempty"`
 	Option   *OptionExpiry         `json:",omitempty"`
@@ -166,6 +169,20 @@ func (a *PaperAdapter) replayPaperOperationLocked(ctx context.Context, operation
 		}
 		_, err := a.advanceQuoteLocked(ctx, operation.Quote.Instrument, operation.Quote.Quote, operation.Quote.NowMS)
 		return err
+	case "quotes":
+		if len(operation.Quotes) == 0 {
+			return errors.New("execution: paper quotes journal payload missing")
+		}
+		for _, q := range operation.Quotes {
+			ids, err := a.advanceQuoteLocked(ctx, q.Instrument, q.Quote, q.NowMS)
+			if err != nil {
+				return err
+			}
+			if len(ids) != 0 {
+				return errors.New("execution: paper quotes batch unexpectedly filled orders")
+			}
+		}
+		return nil
 	case "cancel":
 		_, err := a.cancelLocked(ctx, operation.Cancel)
 		return err
@@ -214,6 +231,16 @@ func (a *PaperAdapter) touchedPaperOrders(operation paperOperation) []string {
 	case "quote":
 		for id, order := range a.pending {
 			if order.intent.Instrument.ID == operation.Quote.Instrument {
+				ids = append(ids, id)
+			}
+		}
+	case "quotes":
+		instruments := make(map[string]bool, len(operation.Quotes))
+		for _, q := range operation.Quotes {
+			instruments[q.Instrument] = true
+		}
+		for id, order := range a.pending {
+			if instruments[order.intent.Instrument.ID] {
 				ids = append(ids, id)
 			}
 		}
@@ -339,6 +366,42 @@ func (a *PaperAdapter) mutatePaperLocked(ctx context.Context, operation paperOpe
 	if _, nested := ctx.Value(storeTxContextKey{}).(scopedStoreTx); nested {
 		return errors.New("execution: durable paper mutation must own its commit boundary")
 	}
+	// Non-filling quotes deferred by AdvanceQuote are journaled first, as one
+	// batch, so every later operation replays on exactly the quote state it saw.
+	if err := a.flushDeferredQuotesLocked(ctx); err != nil {
+		return err
+	}
+	return a.commitPaperLocked(ctx, operation, mutate)
+}
+
+// flushDeferredQuotesLocked journals the deferred quotes as one "quotes"
+// operation. Memory already holds them, so the mutate step is a no-op and the
+// proof covers the post-batch state, which replay reproduces by applying the
+// batch in order. Intermediate quotes per instrument are superseded: accepted
+// quotes are monotone in (AtMS, ReceivedMS), so the latest passes the staleness
+// check against the last journaled quote, its validity depends only on its own
+// recorded nowMS, and the pending set is unchanged since (any other operation
+// flushes first), so no skipped quote could have filled anything. A crash before
+// the flush only loses quote freshness, which the next live quote restores. On
+// failure the quotes stay deferred unless the head shows the batch committed.
+func (a *PaperAdapter) flushDeferredQuotesLocked(ctx context.Context) error {
+	if len(a.deferredQuotes) == 0 {
+		return nil
+	}
+	batch := make([]paperQuoteOperation, 0, len(a.deferredQuotes))
+	for _, q := range a.deferredQuotes {
+		batch = append(batch, q)
+	}
+	sort.Slice(batch, func(i, j int) bool { return batch[i].Instrument < batch[j].Instrument })
+	before := a.journal.head.Sequence
+	err := a.commitPaperLocked(ctx, paperOperation{Kind: "quotes", Quotes: batch}, func(context.Context) error { return nil })
+	if err == nil || a.journal.head.Sequence != before {
+		a.deferredQuotes = nil
+	}
+	return err
+}
+
+func (a *PaperAdapter) commitPaperLocked(ctx context.Context, operation paperOperation, mutate func(context.Context) error) error {
 	if a.journal.head.Sequence == math.MaxInt64 {
 		return errors.New("execution: paper journal sequence exhausted")
 	}

@@ -426,6 +426,15 @@ type AccountReconciliation struct {
 // the difference) and retries once before treating it as a failure.
 var ErrReconciliationCashMismatch = errors.New("execution: reconciliation settled cash mismatch")
 
+// ErrReconciliationOrderAbsent and ErrReconciliationPositionMismatch are the
+// disagreements a venue-side fill or cancellation between the working-order
+// refresh and the account snapshot produces. The private report worker retries
+// them a bounded number of times before freezing.
+var (
+	ErrReconciliationOrderAbsent      = errors.New("execution: local open order absent from authoritative snapshot; recover first")
+	ErrReconciliationPositionMismatch = errors.New("execution: reconciliation real position mismatch")
+)
+
 // Reconcile validates, rather than overwrites, the ledger against an
 // authoritative account snapshot. Unassigned open positions and uncertain
 // orders keep admission frozen; their attribution needs an explicit migration.
@@ -472,7 +481,7 @@ func (s *Store) Reconcile(ctx context.Context, event AccountReconciliation) (boo
 			}
 			if event.Positions[position.Instrument.ID] != position.SignedSteps {
 				rows.Close()
-				return errors.New("execution: reconciliation real position mismatch")
+				return ErrReconciliationPositionMismatch
 			}
 			seen[position.Instrument.ID] = true
 		}

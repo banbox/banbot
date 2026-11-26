@@ -77,6 +77,8 @@ type hubFrozenCommand struct {
 	// Rejected marks a command the owner refused before committing anything.
 	// It is finished: resending it unchanged would be refused forever.
 	Rejected bool `json:",omitempty"`
+	// Attempts counts the failed sends of an edit command (see sendLocked).
+	Attempts int `json:",omitempty"`
 	// Imported marks a command carried over from the legacy SharedOrderMgr
 	// checkpoint (hub_order_legacy_import.go). It is finished history: a retry
 	// with the same ID replays OrderIDs without comparing hashes (the facades
@@ -89,7 +91,12 @@ type hubOrderJournal struct {
 	OrderKinds        map[string]map[string]execution.IntentKind
 	FillTotals        map[string]hubFillTotal
 	PendingDeliveries []hubOrderDelivery
-	Admission         sharedEntryAdmission
+	// EntryDrops is the outbox of OdChgExitFill callbacks for entry requests the
+	// manager dropped (hub_order_entry_end.go). EndNotifyInit marks a journal
+	// whose already-ended unfilled lots were seen once (see poll).
+	EntryDrops    []hubOrderDelivery `json:",omitempty"`
+	EndNotifyInit bool               `json:",omitempty"`
+	Admission     sharedEntryAdmission
 
 	Version           string
 	Account           execution.AccountKey
@@ -113,6 +120,7 @@ type HubOrderMgr struct {
 	config   HubOrderBridgeConfig
 	callback FnOdCb
 	mu       sync.Mutex
+	dropMu   sync.Mutex // serializes deliverDrops; never held while waiting for mu's holders
 	journal  hubOrderJournal
 	jobs     map[sharedJobIdentity]*strat.StratJob
 	archiver orderArchiver
@@ -120,15 +128,23 @@ type HubOrderMgr struct {
 	backoff  map[string]*hubBackoff // per-lot follow-up retry state, memory only
 	// takeoverWarned dedupes takeover warnings; memory only.
 	takeoverWarned map[string]bool
-	lastError      error
-	polling        bool
-	started        bool
-	delivering     bool
-	pollDone       chan struct{}
-	ctx            context.Context
-	cancel         context.CancelFunc
-	done           chan struct{}
-	lockFile       *os.File
+	// marks: last price per symbol seen by UpdateByDataSeries (mark for the
+	// profit fields of open views). infoMu guards infoStage/infoWarned, the
+	// staging area of strategy SetInfo writes (see hub_order_view_state.go); it is
+	// never held together with, or waited for under, mu.
+	marks      map[string]float64
+	infoMu     sync.Mutex
+	infoStage  map[int64]map[string]hubInfoWrite
+	infoWarned map[string]bool
+	lastError  error
+	polling    bool
+	started    bool
+	delivering bool
+	pollDone   chan struct{}
+	ctx        context.Context
+	cancel     context.CancelFunc
+	done       chan struct{}
+	lockFile   *os.File
 }
 
 func hubRandomID() (string, error) {
@@ -190,7 +206,7 @@ func NewHubOrderMgr(deps RuntimeDeps, cfg *HubOrderBridgeConfig, callback FnOdCb
 	} else if errors.Is(err, os.ErrNotExist) {
 		session, e := hubRandomID()
 		err = e
-		m.journal = hubOrderJournal{Version: c.Bridge.Version, Account: c.Account, WriterID: c.WriterID, Session: session, Writers: map[execution.StrategyID]*hubWriter{}, Commands: map[string]*hubFrozenCommand{}, Lots: map[string]*hubProjectedLot{}}
+		m.journal = hubOrderJournal{Version: c.Bridge.Version, Account: c.Account, WriterID: c.WriterID, Session: session, EndNotifyInit: true, Writers: map[execution.StrategyID]*hubWriter{}, Commands: map[string]*hubFrozenCommand{}, Lots: map[string]*hubProjectedLot{}}
 		for _, b := range c.Bridge.Strategies {
 			expected, explicit := c.ExpectedEpoch[b.ID]
 			if !explicit {
@@ -382,7 +398,7 @@ func (m *HubOrderMgr) resumeCommands() error {
 	sort.SliceStable(pending, func(i, j int) bool { return hubCommandSequence(pending[i]) < hubCommandSequence(pending[j]) })
 	for _, command := range pending {
 		m.logResend(command)
-		if err := m.sendLocked(command); err != nil && !errors.Is(err, errSharedEntryRejected) {
+		if err := m.sendLocked(command); err != nil && !errors.Is(err, errSharedEntryRejected) && !errors.Is(err, errHubEditUnconfirmed) {
 			return err
 		}
 	}
@@ -431,6 +447,7 @@ func (m *HubOrderMgr) sendLocked(command *hubFrozenCommand) error {
 	if errors.Is(err, execution.ErrVenueMinimum) {
 		command.Done, command.Rejected = true, true
 		m.deps.Logger().Warn("hub rejected a command below the venue minimum; it is dropped, not retried", zap.Int64("order_id", command.OrderID), zap.Bool("exit", command.Exit != nil))
+		m.queueCommandDropLocked(command, "venue_minimum")
 		if saveErr := m.saveLocked(); saveErr != nil {
 			return saveErr
 		}
@@ -438,15 +455,36 @@ func (m *HubOrderMgr) sendLocked(command *hubFrozenCommand) error {
 	}
 	// Only a NEW entry is dropped for the other refusals (risk/exposure/margin,
 	// price tick, spot short, self-cross): the owner refused it before committing
-	// anything and would refuse the same frozen command every time. An exit, edit
-	// or protection change is never dropped here; it stays fail-closed.
+	// anything and would refuse the same frozen command every time. An exit stays
+	// fail-closed; an edit is dropped below (refusal, or hubEditAttempts failed sends).
 	if code, ok := execution.RejectionCode(err); ok && command.Pending != nil && command.Pending.Action == execution.PendingCreate {
 		command.Done, command.Rejected = true, true
 		m.deps.Logger().Warn("hub rejected an entry; it is dropped, not retried", zap.String("reason", code), zap.Int64("order_id", command.OrderID), zap.String("lot", string(command.Pending.Lot)))
+		m.queueCommandDropLocked(command, code)
 		if saveErr := m.saveLocked(); saveErr != nil {
 			return saveErr
 		}
 		return errSharedEntryRejected
+	}
+	if err != nil && command.Pending != nil && command.Pending.Action != execution.PendingCreate && m.ctx.Err() == nil {
+		// An edit is advisory: the owner refused it (typed rejection, or a stale
+		// revision / vanished lot that arrives as a generic failure) or could not
+		// be reached. It is never resent forever and never stops the robot; a
+		// journal failure still does.
+		code, refused := execution.RejectionCode(err)
+		command.Attempts++
+		if refused || command.Attempts >= hubEditAttempts {
+			command.Done, command.Rejected = true, true
+			m.deps.Logger().Warn("hub edit dropped", zap.String("action", string(command.Pending.Action)), zap.String("reason", code), zap.Int("attempts", command.Attempts), zap.Int64("order_id", command.OrderID), zap.String("lot", string(command.Pending.Lot)), zap.Error(err))
+			if saveErr := m.saveLocked(); saveErr != nil {
+				return saveErr
+			}
+			return errSharedEntryRejected
+		}
+		if saveErr := m.saveLocked(); saveErr != nil {
+			return saveErr
+		}
+		return fmt.Errorf("%w: %v", errHubEditUnconfirmed, err)
 	}
 	if err != nil {
 		return err
@@ -498,6 +536,10 @@ func (m *HubOrderMgr) enter(exs *orm.ExSymbol, tf string, req *strat.EnterReq, s
 	m.started = true
 	id, err := m.enterLocked(exs, tf, req, source)
 	m.mu.Unlock()
+	// Callbacks of entries dropped by this request (or by an older frozen command
+	// resent on the way) run here, outside m.mu; requests they queue are flushed
+	// by deliver, or by the enclosing ProcessOrders drain.
+	m.deliverDrops(false)
 	if errors.Is(err, errSharedEntryRejected) {
 		return nil, nil
 	}
@@ -580,14 +622,18 @@ func (m *HubOrderMgr) enterLocked(exs *orm.ExSymbol, tf string, req *strat.Enter
 	copy := *req
 	copy.StratName = name
 	defaults := makeRuntimeOrderConfig(m.deps, m.deps.DefaultAccount)
-	if m.deps.Core.EnvReal && copy.Leverage != 0 && copy.Leverage != defaults.accountLeverage {
+	// Rejected in dry_run as in live: the owner trades one account leverage.
+	gate := OrderMgr{runtimeDeps: true, runtimeCfg: defaults}
+	if copy.Leverage != 0 && copy.Leverage != gate.accountLeverage() {
 		return 0, errors.New("biz: Hub leverage changes are unsupported")
 	}
 	if copy.Leverage == 0 {
-		gate := OrderMgr{runtimeDeps: true, runtimeCfg: defaults}
 		copy.Leverage = gate.accountLeverage()
 	}
-	defaultStyle := copy.OrderType == core.OrderTypeEmpty && defaults.orderType != ""
+	// A stop entry (trigger, no limit) keeps the empty type like LocalOrderMgr's
+	// request: a default limit near the market would turn it into a stop-limit
+	// whose limit can no longer fill after the trigger.
+	defaultStyle := copy.OrderType == core.OrderTypeEmpty && defaults.orderType != "" && !(copy.Stop > 0 && copy.Limit == 0)
 	if defaultStyle {
 		copy.OrderType = slices.Index(core.OrderTypeEnums, defaults.orderType)
 	}
@@ -640,7 +686,7 @@ func (m *HubOrderMgr) enterLocked(exs *orm.ExSymbol, tf string, req *strat.Enter
 			return 0, err
 		}
 	}
-	allowed, err := admitTimeSeriesEntry(m.deps, timeSeriesJobPolicies(m.jobs, exs.Symbol, tf), &state, snapshot, exs, tf, &copy)
+	allowed, err := admitTimeSeriesEntryAdopting(m.deps, timeSeriesJobPolicies(m.jobs, exs.Symbol, tf), &state, snapshot, exs, tf, &copy)
 	if err != nil {
 		return 0, err
 	}
@@ -651,7 +697,11 @@ func (m *HubOrderMgr) enterLocked(exs *orm.ExSymbol, tf string, req *strat.Enter
 	// group id; a request that cannot be expressed is refused, never dropped.
 	plan, err := newHubLotPlan(&copy, q.Bid.Add(q.Ask).Div(decimal.NewFromInt(2)).InexactFloat64())
 	if err != nil {
-		return 0, hubRejectLadderPlan(m, name, exs.Symbol, req.Tag, err)
+		rejected := hubRejectLadderPlan(m, name, exs.Symbol, req.Tag, err)
+		if saveErr := m.queueRequestDropLocked(name, exs.Symbol, tf, int32(exs.ID), &copy, 0, hubDropLadder, "entry rejected: take-profit ladder / OCO group cannot be expressed on the Hub path: "+err.Error()); saveErr != nil {
+			return 0, saveErr
+		}
+		return 0, rejected
 	}
 	nav := snapshot.SyntheticStrategyCash[b.ID]
 	for _, lot := range snapshot.Lots {
@@ -709,6 +759,9 @@ func (m *HubOrderMgr) enterLocked(exs *orm.ExSymbol, tf string, req *strat.Enter
 		m.deps.Logger().Warn("entry rejected: size below the tradable minimum or above the strategy allowance",
 			zap.String("strategy", name), zap.String("symbol", exs.Symbol), zap.String("tag", req.Tag),
 			zap.String("reference_price", c.ReferencePrice.String()), zap.String("min_notional", instrument.MinNotional.String()), zap.Int64("min_steps", instrument.MinSteps))
+		if saveErr := m.queueRequestDropLocked(name, exs.Symbol, tf, int32(exs.ID), &copy, orderID, hubDropSize, "entry rejected: size below the tradable minimum or above the strategy allowance"); saveErr != nil {
+			return 0, saveErr
+		}
 		return 0, errSharedEntryRejected
 	}
 	if err != nil {
@@ -904,6 +957,15 @@ func (m *HubOrderMgr) RelayOrders(ods []*ormo.InOutOrder) *errs.Error {
 func (m *HubOrderMgr) UpdateByDataSeries(_ []*ormo.InOutOrder, evt *orm.DataSeries) *errs.Error {
 	m.mu.Lock()
 	m.started = true
+	if evt != nil && !evt.IsWarmUp {
+		// The bar close is the mark of open views; the poll below rebuilds them.
+		if closeVal, err := evt.CloseValue(); err == nil && closeVal > 0 {
+			if m.marks == nil {
+				m.marks = map[string]float64{}
+			}
+			m.marks[evt.Symbol()] = closeVal
+		}
+	}
 	m.mu.Unlock()
 	if m.config.LocalAccount && evt != nil && evt.Closed && !evt.IsWarmUp {
 		// No Hub host observes this robot's feeds: persist the closed bar so

@@ -570,6 +570,10 @@ type EnterReq struct {
 
 在默认的prod/dry-run共享账户（Hub）路径上，订单价格（`Limit`、`StopLossLimit`、`TakeProfitLimit`、阶梯止盈各级的`Limit`，以及平仓请求和改单的`Limit`）提交前会按品种价格最小变动单位（tick）就近取整；触发价（`Stop`、`StopLoss`、`TakeProfit`、阶梯各级`Price`）不取整。
 
+在该路径上，未成交的限价入场单也可以通过`SetEnterLimit`、`SetStopLoss`、`SetTakeProfit`、`SetTrailingStop`修改，修改会提交给账户执行服务；改单不会再触发`OnOrderChange`的“订单创建”回调。订单已平仓、账户执行服务拒绝或暂时无法确认的改单只记录告警并被忽略（至多重试数次），不会停止机器人；仅触发价为`Stop`的入场保持触发后市价，不会被`order_type: limit`改成限价。
+
+未成交即终止的入场单在回测与Hub路径上以同样方式通知：一次`OnOrderChange`，类型为`OdChgExitFill`，订单`Status`为`ormo.InOutStatusDelete`，`ExitTag`为原因（详情见`od.Info["status_msg"]`）。可在此清除“订单待成交”标记。原因：限价入场超时（`core.ExitTagEntExp`，`ent_expire`）、OCO兄弟单被撤销（`oco_cancel`）、策略用`ExitReq`自行撤销（该请求的`Tag`）、请求被系统拒绝或丢弃（资金不足、数量为零或低于最小值、不支持的止盈阶梯/OCO组合、账户执行方的风控或价格tick拒绝）：`core.ExitTagForceExit`（`force_exit`）或`core.ExitTagFatalErr`（`fatal_err`，数量或不支持的请求），Hub路径下原因码在`od.Info["reject_code"]`。部分成交后撤销剩余部分不属于此情形。仅被准入限制（`max_open_orders`、`max_simul_open`、禁止入场开关、亏损停止暂停）拒绝的请求在两种模式下均不产生订单也不触发回调。Hub路径下该回调可能在`OpenOrder`/`ProcessOrders`内部执行；回调中新排队的请求随后提交，重启不会重复通知。
+
 同时设置`Stop`和`Limit`即为Stop-Limit入场：价格触及`Stop`后才以`Limit`挂限价单；若`Stop`已被当前价越过，则直接按`Limit`挂限价单。`OrderType`为`core.OrderTypeMarket`时不能设置`Limit`。
 
 例如当前价格为 100，等待突破 120 做多可设置 `&strat.EnterReq{Tag: "breakout", Stop: 120}`；突破 120 后最多愿意以 121 买入，并带止损：
