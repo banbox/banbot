@@ -96,6 +96,8 @@ type BTResult struct {
 	ulcerDay              int64
 	ulcerPending          float64
 	ulcerLastMS           int64
+	ulcerTail             bool       // DailyEquity's last row is the provisional open-day row appended by collectUlcer
+	stateMu               sync.Mutex // serialises the feed goroutine (logState/applyLiquidation) with Collect (status-dump timer)
 	CalcDiff              float64 `json:"calcDiff"`
 	Stability             float64 `json:"stability"`
 	HitSlTp               int     `json:"hitSlTp"`
@@ -757,7 +759,15 @@ func (r *BTResult) dumpBtFiles(reset bool) *errs.Error {
 	return r.dumpDetail("")
 }
 
+// Collect fills the report metrics from the current state. It may run on the status-dump timer goroutine while the
+// backtest still feeds bars, so it holds stateMu like logState.
 func (r *BTResult) Collect() *errs.Error {
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
+	return r.collect()
+}
+
+func (r *BTResult) collect() *errs.Error {
 	orders := r.historyOrders()
 	r.OrderNum = len(orders)
 	sumProfit := float64(0)
@@ -1686,6 +1696,7 @@ func formatUlcer(value *float64, percent bool) string {
 // Daily UTC closes are collected before chart decimation. TotalLegal already
 // includes withdrawn capital, so withdrawals do not create drawdowns.
 func (r *BTResult) recordUlcer(timeMS int64, equity float64) {
+	r.dropUlcerTail()
 	if r.ulcerDaily.Count() == 0 {
 		if r.TotalInvest <= 0 {
 			return
@@ -1715,10 +1726,23 @@ func (r *BTResult) recordUlcer(timeMS int64, equity float64) {
 	r.ulcerPending, r.ulcerLastMS = equity, timeMS
 }
 
+// dropUlcerTail removes the provisional open-day row of an earlier collectUlcer, so that it is replaced by the real
+// close (same key) instead of being repeated, and a repeated collectUlcer does not stack rows.
+func (r *BTResult) dropUlcerTail() {
+	if r.ulcerTail {
+		if n := len(r.DailyEquity); n > 0 {
+			r.DailyEquity = r.DailyEquity[:n-1]
+		}
+		r.ulcerTail = false
+	}
+}
+
 // applyLiquidation turns the state after a liquidation into the reported result: equity 0 from the liquidation to the
 // end of the run window (plot samples, daily equity, drawdown, min assets), so the ratios are not computed on a
 // shorter, more flattering window. The caller has already closed the positions.
 func (r *BTResult) applyLiquidation(wallets *biz.BanWallets, atMS int64, symbol, reason, cause string) {
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
 	r.Liquidated, r.LiquidatedAtMS, r.LiquidatedSymbol, r.LiquidatedReason = true, atMS, symbol, reason
 	r.LiquidatedCause = cause
 	if r.ulcerDaily.Invalid() || r.ulcerPending < 0 {
@@ -1779,8 +1803,11 @@ func (r *BTResult) collectUlcer() {
 	if r.ulcerDaily.Count() > 0 {
 		a := r.ulcerDaily
 		a.Add(r.ulcerPending)
-		if n := len(r.DailyEquity); n == 0 || r.DailyEquity[n-1][0] != float64((r.ulcerDay+1)*86400000) {
-			r.DailyEquity = append(r.DailyEquity, [2]float64{float64((r.ulcerDay + 1) * 86400000), r.ulcerPending})
+		r.dropUlcerTail()
+		tailKey := float64((r.ulcerDay + 1) * 86400000)
+		if n := len(r.DailyEquity); n == 0 || r.DailyEquity[n-1][0] < tailKey {
+			r.DailyEquity = append(r.DailyEquity, [2]float64{tailKey, r.ulcerPending})
+			r.ulcerTail = true
 		}
 		r.UlcerIndex, r.UlcerPerformanceIndex, _ = a.Performance(years, 0)
 		r.UlcerSource = "daily_equity"
@@ -1820,6 +1847,8 @@ func (r *BTResult) equityNow(wallets *biz.BanWallets) float64 {
 }
 
 func (r *BTResult) logState(startMS, timeMS int64, odNum int) {
+	r.stateMu.Lock()
+	defer r.stateMu.Unlock()
 	if r.StartMS == 0 {
 		r.StartMS = startMS
 	}

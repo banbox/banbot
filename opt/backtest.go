@@ -995,7 +995,9 @@ func (b *BackTest) RunContext(ctx context.Context) *errs.Error {
 		b.normalizeBacktestResultRange()
 		b.applyLiquidation(wallets, liq.atMS, liq.symbol, liq.reason, liq.cause)
 	} else {
+		b.stateMu.Lock()
 		b.logPlot(wallets, b.TimeMS(), -1, -1)
+		b.stateMu.Unlock()
 		b.normalizeBacktestResultRange()
 	}
 	if err := b.Collect(); err != nil {
@@ -1103,7 +1105,9 @@ func (b *BackTest) cronDumpBtStatus() {
 		}
 		b.lastDumpMs = curTime
 		b.Logger().Info("dump backTest status to files...")
-		if err := b.Collect(); err != nil {
+		b.stateMu.Lock()
+		defer b.stateMu.Unlock()
+		if err := b.collect(); err != nil {
 			b.Logger().Error("dump backTest status collect fail", zap.Error(err))
 			return
 		}

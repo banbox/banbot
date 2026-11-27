@@ -120,3 +120,74 @@ func TestReportUlcerJSONAndOptimizationRoundTrip(t *testing.T) {
 		t.Fatal("zero UI is defined, UPI is not")
 	}
 }
+
+// An interim Collect (the 5-minute status dump in cronDumpBtStatus runs it while the backtest is still feeding bars)
+// used to append the open day's tail row to DailyEquity; the next day close then appended the same day key again.
+func TestInterimCollectUlcerKeepsDailyEquityKeysUnique(t *testing.T) {
+	const day = int64(86400000)
+	start := int64(1700006400000)
+	build := func(interim bool) *BTResult {
+		r := NewBTResult()
+		r.TotalInvest = 100
+		r.StartMS = start
+		r.recordUlcer(start+1, 105)
+		r.recordUlcer(start+day+1, 95)
+		if interim {
+			r.EndMS = start + day + 1
+			r.collectUlcer()
+		}
+		r.recordUlcer(start+2*day+1, 105)
+		r.recordUlcer(start+3*day, 110)
+		r.EndMS = start + 3*day
+		r.collectUlcer()
+		return r
+	}
+	ref, got := build(false), build(true)
+	for i := 1; i < len(got.DailyEquity); i++ {
+		if got.DailyEquity[i][0] <= got.DailyEquity[i-1][0] {
+			t.Fatalf("non-increasing day key: %v", got.DailyEquity)
+		}
+	}
+	if len(ref.DailyEquity) != len(got.DailyEquity) {
+		t.Fatalf("interim collect changed rows: %v vs %v", ref.DailyEquity, got.DailyEquity)
+	}
+	for i := range ref.DailyEquity {
+		if ref.DailyEquity[i] != got.DailyEquity[i] {
+			t.Fatalf("row %d: %v vs %v", i, ref.DailyEquity[i], got.DailyEquity[i])
+		}
+	}
+	if *ref.UlcerIndex != *got.UlcerIndex {
+		t.Fatalf("ulcer changed %v vs %v", *ref.UlcerIndex, *got.UlcerIndex)
+	}
+}
+
+// The status-dump timer goroutine calls Collect while the feed goroutine calls logState: both must be serialised on
+// the result (run with -race).
+func TestCollectRacesWithLogState(t *testing.T) {
+	const day = int64(86400000)
+	start := int64(1700006400000)
+	deps := legacyReplayReportDeps()
+	deps.Clock.SetTimeMS(start)
+	deps.Market.Prices.SetPricesAt(start, map[string]float64{"USDT": 1}, "")
+	wallet := biz.InitFakeWalletsWithRuntimeDeps(deps.bizRuntimeDeps())
+	wallet.Items = map[string]*biz.ItemWallet{"USDT": {Coin: "USDT", Available: 100}}
+	r := NewBTResult()
+	r.reportDeps = deps
+	r.TotalInvest = 100
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := int64(0); i < 300; i++ {
+			r.logState(start, start+i*day/3, 0)
+		}
+	}()
+	for i := 0; i < 300; i++ {
+		_ = r.Collect()
+	}
+	<-done
+	for i := 1; i < len(r.DailyEquity); i++ {
+		if r.DailyEquity[i][0] <= r.DailyEquity[i-1][0] {
+			t.Fatalf("non-increasing day key at %d: %v", i, r.DailyEquity[i-1:i+1])
+		}
+	}
+}
